@@ -1,0 +1,10 @@
+lib/gtsam/
+lib/symforce/
+src/cc_slam_graph/
+**/*.pyc
+.venv/
+.claude/
+.envrc/
+build/
+install/
+log/
