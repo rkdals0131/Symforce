@@ -8,3 +8,4 @@ src/cc_slam_graph/
 build/
 install/
 log/
+.env
