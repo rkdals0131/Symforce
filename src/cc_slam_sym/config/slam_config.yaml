@@ -1,0 +1,62 @@
+# CC-SLAM-SYM Configuration
+
+# SLAM Backend Settings
+slam_backend:
+  # Keyframe selection
+  keyframe_trans_threshold: 1.0  # meters
+  keyframe_rot_threshold: 0.2    # radians (~11 degrees)
+  
+  # Optimization
+  optimization_interval: 5       # Optimize every N keyframes
+  use_isam2: true
+  isam2_relinearize_threshold: 0.01
+  isam2_relinearize_skip: 10
+  
+  # Data association
+  max_landmark_distance: 2.0     # meters
+  max_mahalanobis_distance: 5.991  # chi-squared 95% for 2 DOF
+  enforce_color_matching: true
+  new_landmark_threshold: 3.0    # meters
+  
+  # Loop closure
+  enable_loop_closure: true
+  loop_search_radius: 5.0        # meters
+  min_loop_time_diff: 30.0       # seconds
+  min_common_landmarks: 5
+
+# Sensor noise models
+noise_models:
+  # Odometry noise (x, y, theta)
+  odometry_sigmas: [0.1, 0.1, 0.05]
+  
+  # Landmark observation noise
+  landmark_base_sigma: 0.05
+  landmark_distance_scale: 0.01  # sigma = base + scale * distance
+  
+  # GPS noise (RTK)
+  gps_sigmas: [0.02, 0.02]       # meters
+  
+  # IMU noise
+  imu_accel_noise_density: 0.01  # m/s^2/sqrt(Hz)
+  imu_gyro_noise_density: 0.001  # rad/s/sqrt(Hz)
+  imu_accel_bias_stability: 0.1  # m/s^2
+  imu_gyro_bias_stability: 0.01  # rad/s
+
+# Visualization
+visualization:
+  publish_rate: 10.0             # Hz
+  show_covariances: true
+  show_constraints: true
+  trajectory_line_width: 2.0
+  
+# Performance monitoring
+performance:
+  enable_profiling: true
+  log_timing: true
+  max_optimization_time: 50.0    # milliseconds
+
+# System settings  
+system:
+  num_threads: 4
+  max_queue_size: 1000
+  enable_debug_output: false

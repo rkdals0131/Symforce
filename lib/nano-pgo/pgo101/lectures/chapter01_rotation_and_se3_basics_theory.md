@@ -191,8 +191,7 @@ $$SE(3) = \left\{ T = \begin{bmatrix} R & \mathbf{t} \\ \mathbf{0}^T & 1 \end{bm
     $$T_1 \cdot T_2 = \begin{bmatrix} R_1 & \mathbf{t}_1 \\ \mathbf{0}^T & 1 \end{bmatrix} \begin{bmatrix} R_2 & \mathbf{t}_2 \\ \mathbf{0}^T & 1 \end{bmatrix} = \begin{bmatrix} R_1 R_2 & R_1 \mathbf{t}_2 + \mathbf{t}_1 \\ \mathbf{0}^T & 1 \end{bmatrix}$$
 
 -   **역변환 (Inverse)**: 변환을 되돌리는 연산입니다. B에서 A로의 변환은 A에서 B로의 변환의 역행렬입니다.
-    $$ T_{BA} = T_{AB}^{-1} = \begin{bmatrix} R^T & -R^T \mathbf{t} \\
-\mathbf{0}^T & 1 \end{bmatrix} $$
+    $$ T_{BA} = T_{AB}^{-1} = \begin{bmatrix} R^T & -R^T \mathbf{t} \\ \mathbf{0}^T & 1 \end{bmatrix} $$
 
 -   **점 변환 (Action on a point)**: B 좌표계에서 표현된 점 $\mathbf{p}_B$ 를 A 좌표계의 점 $\mathbf{p}_A$ 로 변환합니다. (점을 동차 좌표 [x, y, z, 1] 로 만들어 계산합니다.)
     $$ \begin{bmatrix} \mathbf{p}_A \\ 1 \end{bmatrix} = T_{AB} \cdot \begin{bmatrix} \mathbf{p}_B \\ 1 \end{bmatrix} $$
