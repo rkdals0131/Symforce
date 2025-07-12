@@ -1,0 +1,37 @@
+# Dummy Publisher Configuration for CC-SLAM-SYM
+
+dummy_publisher:
+  ros__parameters:
+    # Scenario settings
+    scenario:
+      id: 2                    # 1: straight track, 2: Formula Student track
+      
+    # Publishing rates (Hz)
+    publish_rates:
+      cones: 20.0             # Cone observation rate
+      imu: 100.0              # IMU data rate
+      gps: 8.0                # GPS fix rate
+      
+    # Vehicle simulation
+    vehicle:
+      speed: 2.0              # m/s - default forward speed
+      
+    # Sensor simulation
+    sensors:
+      # Cone detection parameters
+      cone_detection:
+        max_range: 15.0       # meters - maximum detection range
+        fov_deg: 120.0        # degrees - field of view
+        roi_type: "sector"    # "sector" (fan shape) or "rectangle"
+        
+      # Noise parameters for observations
+      noise:
+        position_stddev: 0.05 # meters - cone position noise
+        odom_position: 0.1    # meters - odometry position noise (increased for visibility)
+        odom_angle: 0.05      # radians - odometry angle noise (increased for visibility)
+        
+    # Visualization
+    visualization:
+      publish_ground_truth_cones: true
+      publish_centerline: true
+      publish_roi: true
