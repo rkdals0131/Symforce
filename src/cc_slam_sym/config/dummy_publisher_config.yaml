@@ -43,8 +43,8 @@ dummy_publisher:
         imu_gyro_white_noise: 0.0002    # 라디안/초 - 자이로스코프 백색 잡음 (순간 노이즈)
         
         # 오도메트리 누적 드리프트
-        odom_drift_rate_linear: 15.5     # 미터당 % - 선형 이동 시 누적 드리프트 비율
-        odom_drift_rate_angular: 15.2    # 라디안당 % - 회전 시 누적 드리프트 비율
+        odom_drift_rate_linear: 45.5     # 미터당 % - 선형 이동 시 누적 드리프트 비율
+        odom_drift_rate_angular: 25.2    # 라디안당 % - 회전 시 누적 드리프트 비율
         
       # 감지 오류 시뮬레이션 (LiDAR + 카메라 융합 문제)
       detection_errors:

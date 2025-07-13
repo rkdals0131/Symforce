@@ -240,33 +240,30 @@ class OdometrySimulator:
     def __init__(self, config: SensorNoiseConfig):
         self.config = config
         
-        # Cumulative drift states
-        self.drift_x = 0.0
-        self.drift_y = 0.0
-        self.drift_theta = 0.0
+        # Odometry internal state (accumulates from origin)
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.odom_theta = 0.0
+        
+        # Previous ground truth state (for calculating deltas)
+        self.prev_true_x = 0.0
+        self.prev_true_y = 0.0
+        self.prev_true_theta = 0.0
         
         # Track total distance for drift calculation
         self.total_distance = 0.0
         self.total_rotation = 0.0
+        
+        # First update flag
+        self.first_update = True
     
-    def update_drift(self, distance_moved: float, angle_rotated: float) -> None:
-        """Update cumulative drift based on movement"""
-        # Linear drift proportional to distance
-        if distance_moved > 0:
-            drift_magnitude = distance_moved * self.config.odom_drift_rate_linear * 0.01
-            drift_angle = np.random.uniform(0, 2 * np.pi)
-            # Fixed: Remove random multiplier that can cancel out drift
-            self.drift_x += drift_magnitude * np.cos(drift_angle)
-            self.drift_y += drift_magnitude * np.sin(drift_angle)
-        
-        # Angular drift proportional to rotation
-        if abs(angle_rotated) > 0:
-            # Fixed: Consistent drift accumulation direction
-            self.drift_theta += angle_rotated * self.config.odom_drift_rate_angular * 0.01
-        
-        # Update totals
-        self.total_distance += distance_moved
-        self.total_rotation += abs(angle_rotated)
+    def _normalize_angle(self, angle: float) -> float:
+        """Normalize angle to [-pi, pi]"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
     
     def generate_odometry_data(self, true_x: float, true_y: float, true_theta: float,
                               true_vx: float, true_vy: float, true_vtheta: float,
@@ -285,23 +282,85 @@ class OdometrySimulator:
         Returns:
             Odometry message with drift and noise
         """
-        # Calculate movement since last update
-        distance_moved = np.sqrt(true_vx**2 + true_vy**2) * dt
-        angle_rotated = true_vtheta * dt
+        # Initialize on first update
+        if self.first_update:
+            self.prev_true_x = true_x
+            self.prev_true_y = true_y
+            self.prev_true_theta = true_theta
+            self.odom_x = true_x
+            self.odom_y = true_y
+            self.odom_theta = true_theta
+            self.first_update = False
         
-        # Update cumulative drift
-        self.update_drift(distance_moved, angle_rotated)
+        # Calculate ground truth delta in global frame
+        delta_x_global = true_x - self.prev_true_x
+        delta_y_global = true_y - self.prev_true_y
+        delta_theta = self._normalize_angle(true_theta - self.prev_true_theta)
         
-        # Debug: Print drift values periodically
+        # Convert global delta to robot's local frame (at previous position)
+        cos_prev = np.cos(self.prev_true_theta)
+        sin_prev = np.sin(self.prev_true_theta)
+        delta_x_local = delta_x_global * cos_prev + delta_y_global * sin_prev
+        delta_y_local = -delta_x_global * sin_prev + delta_y_global * cos_prev
+        
+        # Calculate distance moved for drift computation
+        distance_moved = np.sqrt(delta_x_local**2 + delta_y_local**2)
+        
+        # Apply drift to the movement
+        # Linear drift: proportional to distance moved
+        if distance_moved > 0:
+            # Add systematic drift (bias)
+            drift_factor_linear = 1.0 + self.config.odom_drift_rate_linear * 0.01
+            delta_x_local *= drift_factor_linear
+            delta_y_local *= drift_factor_linear
+            
+            # Add random drift component
+            drift_magnitude = distance_moved * self.config.odom_drift_rate_linear * 0.001
+            drift_angle = np.random.uniform(-np.pi/4, np.pi/4)  # Drift within ±45°
+            delta_x_local += drift_magnitude * np.cos(drift_angle)
+            delta_y_local += drift_magnitude * np.sin(drift_angle)
+        
+        # Angular drift: proportional to rotation
+        if abs(delta_theta) > 0:
+            # Systematic angular drift
+            drift_factor_angular = 1.0 + self.config.odom_drift_rate_angular * 0.01
+            delta_theta *= drift_factor_angular
+        
+        # Add white noise to deltas
+        delta_x_local += np.random.normal(0, self.config.odom_position_noise * 0.1)
+        delta_y_local += np.random.normal(0, self.config.odom_position_noise * 0.1)
+        delta_theta += np.random.normal(0, self.config.odom_angle_noise * 0.1)
+        
+        # Update odometry state by transforming local delta to odometry frame
+        # Note: Use the odometry's current heading, not ground truth
+        cos_odom = np.cos(self.odom_theta)
+        sin_odom = np.sin(self.odom_theta)
+        self.odom_x += delta_x_local * cos_odom - delta_y_local * sin_odom
+        self.odom_y += delta_x_local * sin_odom + delta_y_local * cos_odom
+        self.odom_theta = self._normalize_angle(self.odom_theta + delta_theta)
+        
+        # Update tracking variables
+        self.total_distance += distance_moved
+        self.total_rotation += abs(delta_theta)
+        
+        # Update previous ground truth state
+        self.prev_true_x = true_x
+        self.prev_true_y = true_y
+        self.prev_true_theta = true_theta
+        
+        # Debug output
         if hasattr(self, '_debug_counter'):
             self._debug_counter += 1
         else:
             self._debug_counter = 0
             
         if self._debug_counter % 50 == 0:
-            print(f"DEBUG DRIFT: x={self.drift_x:.6f}, y={self.drift_y:.6f}, theta={self.drift_theta:.6f}, "
-                  f"dist_moved={distance_moved:.6f}, angle_rot={angle_rotated:.6f}, total_dist={self.total_distance:.2f}, "
-                  f"drift_rates=[{self.config.odom_drift_rate_linear}, {self.config.odom_drift_rate_angular}]")
+            error_x = self.odom_x - true_x
+            error_y = self.odom_y - true_y
+            error_theta = self._normalize_angle(self.odom_theta - true_theta)
+            print(f"ODOM DEBUG: error_x={error_x:.3f}, error_y={error_y:.3f}, "
+                  f"error_theta={np.degrees(error_theta):.1f}°, "
+                  f"total_dist={self.total_distance:.1f}m")
         
         # Create odometry message
         odom_msg = Odometry()
@@ -309,35 +368,31 @@ class OdometrySimulator:
         odom_msg.header.frame_id = "odom"
         odom_msg.child_frame_id = child_frame_id
         
-        # Apply drift and noise to position
-        odom_msg.pose.pose.position.x = (true_x + self.drift_x + 
-                                        np.random.normal(0, self.config.odom_position_noise))
-        odom_msg.pose.pose.position.y = (true_y + self.drift_y + 
-                                        np.random.normal(0, self.config.odom_position_noise))
+        # Set position with additional white noise
+        odom_msg.pose.pose.position.x = self.odom_x + np.random.normal(0, self.config.odom_position_noise)
+        odom_msg.pose.pose.position.y = self.odom_y + np.random.normal(0, self.config.odom_position_noise)
         odom_msg.pose.pose.position.z = 0.0
         
-        # Apply drift and noise to orientation
-        noisy_theta = true_theta + self.drift_theta + np.random.normal(0, self.config.odom_angle_noise)
+        # Set orientation with noise
+        noisy_theta = self.odom_theta + np.random.normal(0, self.config.odom_angle_noise)
         q = quaternion_from_euler(0, 0, noisy_theta)
         odom_msg.pose.pose.orientation.x = q[0]
         odom_msg.pose.pose.orientation.y = q[1]
         odom_msg.pose.pose.orientation.z = q[2]
         odom_msg.pose.pose.orientation.w = q[3]
         
-        # Add noise to velocities
+        # Set velocities with noise (in robot's local frame)
         odom_msg.twist.twist.linear.x = true_vx + np.random.normal(0, 0.05)
         odom_msg.twist.twist.linear.y = true_vy + np.random.normal(0, 0.05)
         odom_msg.twist.twist.angular.z = true_vtheta + np.random.normal(0, 0.01)
         
         # Covariances
-        # Pose covariance
         pose_cov = np.zeros(36)
         pose_cov[0] = self.config.odom_position_noise**2  # x
         pose_cov[7] = self.config.odom_position_noise**2  # y
         pose_cov[35] = self.config.odom_angle_noise**2    # theta
         odom_msg.pose.covariance = pose_cov.tolist()
         
-        # Twist covariance
         twist_cov = np.zeros(36)
         twist_cov[0] = 0.01   # vx
         twist_cov[7] = 0.01   # vy

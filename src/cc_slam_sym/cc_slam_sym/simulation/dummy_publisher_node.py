@@ -271,17 +271,15 @@ class DummyPublisher(Node):
         
         # Odom -> Base_link transform (only if odom simulation is enabled)
         if self.odom_sim_enabled:
-            # Apply same noise as odometry messages (drift + white noise)
+            # Use the odometry simulator's internal state
             import numpy as np
             position_noise = self.sensor_sim.odom_sim.config.odom_position_noise
             angle_noise = self.sensor_sim.odom_sim.config.odom_angle_noise
             
-            noisy_x = (self.vehicle_state.position[0] + self.sensor_sim.odom_sim.drift_x + 
-                       np.random.normal(0, position_noise))
-            noisy_y = (self.vehicle_state.position[1] + self.sensor_sim.odom_sim.drift_y + 
-                       np.random.normal(0, position_noise))
-            noisy_theta = (self.vehicle_state.orientation[2] + self.sensor_sim.odom_sim.drift_theta + 
-                           np.random.normal(0, angle_noise))
+            # Use odometry's estimated position (already includes drift)
+            noisy_x = self.sensor_sim.odom_sim.odom_x + np.random.normal(0, position_noise)
+            noisy_y = self.sensor_sim.odom_sim.odom_y + np.random.normal(0, position_noise)
+            noisy_theta = self.sensor_sim.odom_sim.odom_theta + np.random.normal(0, angle_noise)
             
             # Odom -> Base_link transform (noisy)
             odom_to_base = TransformStamped()
