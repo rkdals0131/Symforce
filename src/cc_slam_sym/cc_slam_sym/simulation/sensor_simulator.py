@@ -22,15 +22,23 @@ import rclpy.time
 @dataclass
 class SensorNoiseConfig:
     """Configuration for sensor noise parameters"""
-    # IMU parameters
-    imu_accel_bias_drift: float = 0.1      # m/s² - 가속도계 바이어스 변화율
-    imu_gyro_bias_drift: float = 0.01      # rad/s - 자이로스코프 바이어스 변화율
-    imu_accel_white_noise: float = 0.002   # m/s² - 가속도계 백색 잡음
-    imu_gyro_white_noise: float = 0.0002   # rad/s - 자이로스코프 백색 잡음
+    # IMU parameters (Allan Variance based)
+    imu_gyro_noise_density: float = 0.005      # rad/s/√Hz
+    imu_gyro_bias_stability: float = 0.1       # rad/s
+    imu_gyro_random_walk: float = 0.00001      # rad/s²/√Hz
+    
+    imu_accel_noise_density: float = 0.01      # m/s²/√Hz
+    imu_accel_bias_stability: float = 0.01     # m/s²
+    imu_accel_random_walk: float = 0.0001      # m/s³/√Hz
     
     # GPS parameters
-    gps_position_noise: float = 2.0        # m - GPS 위치 노이즈
-    gps_altitude_noise: float = 5.0        # m - GPS 고도 노이즈
+    gps_mode: str = "rtk"                      # GPS mode
+    gps_rtk_fix_noise_h: float = 0.02          # m - RTK Fix horizontal
+    gps_rtk_fix_noise_v: float = 0.04          # m - RTK Fix vertical  
+    gps_rtk_float_noise_h: float = 0.3         # m - RTK Float horizontal
+    gps_rtk_float_noise_v: float = 0.5         # m - RTK Float vertical
+    gps_single_noise_h: float = 2.0            # m - Single horizontal
+    gps_single_noise_v: float = 5.0            # m - Single vertical
     
     # Odometry drift parameters (x, y, theta)
     odom_drift_x_systematic: float = 0.0       # % - x축 bias (systematic error)
@@ -59,28 +67,33 @@ class ImuSimulator:
         self.gravity = 9.81
     
     def update_bias(self, dt: float) -> None:
-        """Update bias states with slow drift"""
-        # Acceleration bias drift
-        self.accel_bias_x += np.random.normal(0, self.config.imu_accel_bias_drift * dt)
-        self.accel_bias_y += np.random.normal(0, self.config.imu_accel_bias_drift * dt)
-        self.accel_bias_z += np.random.normal(0, self.config.imu_accel_bias_drift * dt)
+        """Update bias states using Allan variance random walk model"""
+        # Acceleration bias random walk: sigma = K * sqrt(dt)
+        accel_rw_sigma = self.config.imu_accel_random_walk * np.sqrt(dt)
+        self.accel_bias_x += np.random.normal(0, accel_rw_sigma)
+        self.accel_bias_y += np.random.normal(0, accel_rw_sigma)
+        self.accel_bias_z += np.random.normal(0, accel_rw_sigma)
         
-        # Gyroscope bias drift
-        self.gyro_bias_x += np.random.normal(0, self.config.imu_gyro_bias_drift * dt)
-        self.gyro_bias_y += np.random.normal(0, self.config.imu_gyro_bias_drift * dt)
-        self.gyro_bias_z += np.random.normal(0, self.config.imu_gyro_bias_drift * dt)
+        # Gyroscope bias random walk
+        gyro_rw_sigma = self.config.imu_gyro_random_walk * np.sqrt(dt)
+        self.gyro_bias_x += np.random.normal(0, gyro_rw_sigma)
+        self.gyro_bias_y += np.random.normal(0, gyro_rw_sigma)
+        self.gyro_bias_z += np.random.normal(0, gyro_rw_sigma)
         
-        # Limit bias to reasonable values
-        max_accel_bias = 0.5  # m/s²
-        max_gyro_bias = 0.05   # rad/s
+        # Limit bias to bias stability values
+        self.accel_bias_x = np.clip(self.accel_bias_x, -self.config.imu_accel_bias_stability, 
+                                   self.config.imu_accel_bias_stability)
+        self.accel_bias_y = np.clip(self.accel_bias_y, -self.config.imu_accel_bias_stability,
+                                   self.config.imu_accel_bias_stability)
+        self.accel_bias_z = np.clip(self.accel_bias_z, -self.config.imu_accel_bias_stability,
+                                   self.config.imu_accel_bias_stability)
         
-        self.accel_bias_x = np.clip(self.accel_bias_x, -max_accel_bias, max_accel_bias)
-        self.accel_bias_y = np.clip(self.accel_bias_y, -max_accel_bias, max_accel_bias)
-        self.accel_bias_z = np.clip(self.accel_bias_z, -max_accel_bias, max_accel_bias)
-        
-        self.gyro_bias_x = np.clip(self.gyro_bias_x, -max_gyro_bias, max_gyro_bias)
-        self.gyro_bias_y = np.clip(self.gyro_bias_y, -max_gyro_bias, max_gyro_bias)
-        self.gyro_bias_z = np.clip(self.gyro_bias_z, -max_gyro_bias, max_gyro_bias)
+        self.gyro_bias_x = np.clip(self.gyro_bias_x, -self.config.imu_gyro_bias_stability,
+                                  self.config.imu_gyro_bias_stability)
+        self.gyro_bias_y = np.clip(self.gyro_bias_y, -self.config.imu_gyro_bias_stability,
+                                  self.config.imu_gyro_bias_stability)
+        self.gyro_bias_z = np.clip(self.gyro_bias_z, -self.config.imu_gyro_bias_stability,
+                                  self.config.imu_gyro_bias_stability)
     
     def generate_imu_data(self, true_accel: np.ndarray, true_angular_vel: np.ndarray, 
                          true_orientation: Tuple[float, float, float, float],
@@ -110,22 +123,28 @@ class ImuSimulator:
         # In robot frame, gravity appears as upward acceleration when stationary
         gravity_in_robot = np.array([0, 0, self.gravity])
         
+        # Calculate white noise from noise density
+        # White noise sigma = noise_density * sqrt(sampling_rate)
+        sampling_rate = 1.0 / dt  # Hz
+        accel_white_noise_sigma = self.config.imu_accel_noise_density * np.sqrt(sampling_rate)
+        gyro_white_noise_sigma = self.config.imu_gyro_noise_density * np.sqrt(sampling_rate)
+        
         # Add bias and white noise to acceleration
         accel_with_gravity = true_accel + gravity_in_robot
         imu_msg.linear_acceleration.x = (accel_with_gravity[0] + self.accel_bias_x + 
-                                        np.random.normal(0, self.config.imu_accel_white_noise))
+                                        np.random.normal(0, accel_white_noise_sigma))
         imu_msg.linear_acceleration.y = (accel_with_gravity[1] + self.accel_bias_y + 
-                                        np.random.normal(0, self.config.imu_accel_white_noise))
+                                        np.random.normal(0, accel_white_noise_sigma))
         imu_msg.linear_acceleration.z = (accel_with_gravity[2] + self.accel_bias_z + 
-                                        np.random.normal(0, self.config.imu_accel_white_noise))
+                                        np.random.normal(0, accel_white_noise_sigma))
         
         # Add bias and white noise to angular velocity
         imu_msg.angular_velocity.x = (true_angular_vel[0] + self.gyro_bias_x + 
-                                     np.random.normal(0, self.config.imu_gyro_white_noise))
+                                     np.random.normal(0, gyro_white_noise_sigma))
         imu_msg.angular_velocity.y = (true_angular_vel[1] + self.gyro_bias_y + 
-                                     np.random.normal(0, self.config.imu_gyro_white_noise))
+                                     np.random.normal(0, gyro_white_noise_sigma))
         imu_msg.angular_velocity.z = (true_angular_vel[2] + self.gyro_bias_z + 
-                                     np.random.normal(0, self.config.imu_gyro_white_noise))
+                                     np.random.normal(0, gyro_white_noise_sigma))
         
         # Set orientation (with small noise)
         orientation_noise = 0.001  # Very small orientation noise
@@ -143,22 +162,27 @@ class ImuSimulator:
         imu_msg.orientation.w /= quat_norm
         
         # Set covariances (diagonal matrices) - must be exactly 9 floats
+        # Orientation covariance (small fixed value)
         imu_msg.orientation_covariance = [
             0.01, 0.0, 0.0,
             0.0, 0.01, 0.0,
             0.0, 0.0, 0.01
         ]
         
+        # Angular velocity covariance (based on noise density)
+        gyro_variance = gyro_white_noise_sigma**2
         imu_msg.angular_velocity_covariance = [
-            float(self.config.imu_gyro_white_noise**2), 0.0, 0.0,
-            0.0, float(self.config.imu_gyro_white_noise**2), 0.0,
-            0.0, 0.0, float(self.config.imu_gyro_white_noise**2)
+            float(gyro_variance), 0.0, 0.0,
+            0.0, float(gyro_variance), 0.0,
+            0.0, 0.0, float(gyro_variance)
         ]
         
+        # Linear acceleration covariance (based on noise density)
+        accel_variance = accel_white_noise_sigma**2
         imu_msg.linear_acceleration_covariance = [
-            float(self.config.imu_accel_white_noise**2), 0.0, 0.0,
-            0.0, float(self.config.imu_accel_white_noise**2), 0.0,
-            0.0, 0.0, float(self.config.imu_accel_white_noise**2)
+            float(accel_variance), 0.0, 0.0,
+            0.0, float(accel_variance), 0.0,
+            0.0, 0.0, float(accel_variance)
         ]
         
         return imu_msg
@@ -179,6 +203,9 @@ class GpsSimulator:
         self.config = config
         self.origin_lat = origin_lat
         self.origin_lon = origin_lon
+        
+        # For debugging: print origin
+        print(f"GPS Simulator initialized at origin: {origin_lat}, {origin_lon}")
     
     def xy_to_latlon(self, x: float, y: float) -> Tuple[float, float]:
         """Convert local XY coordinates to latitude/longitude"""
@@ -194,7 +221,7 @@ class GpsSimulator:
     def generate_gps_data(self, true_x: float, true_y: float, true_z: float,
                          timestamp: rclpy.time.Time) -> NavSatFix:
         """
-        Generate GPS NavSatFix message with noise
+        Generate GPS NavSatFix message with RTK mode support
         
         Args:
             true_x, true_y: True position in local coordinates (meters)
@@ -202,12 +229,31 @@ class GpsSimulator:
             timestamp: ROS timestamp
         
         Returns:
-            NavSatFix message with GPS noise
+            NavSatFix message with mode-appropriate GPS noise
         """
+        # Determine noise levels based on GPS mode
+        if self.config.gps_mode == "rtk" or self.config.gps_mode == "rtk_fix":
+            h_noise = self.config.gps_rtk_fix_noise_h
+            v_noise = self.config.gps_rtk_fix_noise_v
+            status = 2  # DGPS/RTK fix
+        elif self.config.gps_mode == "rtk_float":
+            h_noise = self.config.gps_rtk_float_noise_h
+            v_noise = self.config.gps_rtk_float_noise_v
+            status = 2  # DGPS/RTK fix (float)
+        elif self.config.gps_mode == "dgps":
+            # Use intermediate values between single and RTK float
+            h_noise = (self.config.gps_single_noise_h + self.config.gps_rtk_float_noise_h) / 2
+            v_noise = (self.config.gps_single_noise_v + self.config.gps_rtk_float_noise_v) / 2
+            status = 2  # DGPS fix
+        else:  # single
+            h_noise = self.config.gps_single_noise_h
+            v_noise = self.config.gps_single_noise_v
+            status = 1  # GPS fix
+        
         # Add noise to position
-        noisy_x = true_x + np.random.normal(0, self.config.gps_position_noise)
-        noisy_y = true_y + np.random.normal(0, self.config.gps_position_noise)
-        noisy_z = true_z + np.random.normal(0, self.config.gps_altitude_noise)
+        noisy_x = true_x + np.random.normal(0, h_noise)
+        noisy_y = true_y + np.random.normal(0, h_noise)
+        noisy_z = true_z + np.random.normal(0, v_noise)
         
         # Convert to lat/lon
         lat, lon = self.xy_to_latlon(noisy_x, noisy_y)
@@ -221,15 +267,15 @@ class GpsSimulator:
         gps_msg.longitude = lon
         gps_msg.altitude = noisy_z
         
-        # Status (0 = no fix, 1 = GPS fix, 2 = DGPS fix)
-        gps_msg.status.status = 1
+        # Status based on mode
+        gps_msg.status.status = status
         gps_msg.status.service = 1  # GPS service
         
         # Position covariance (m²) - must be exactly 9 floats
         gps_msg.position_covariance = [
-            float(self.config.gps_position_noise**2), 0.0, 0.0,
-            0.0, float(self.config.gps_position_noise**2), 0.0,
-            0.0, 0.0, float(self.config.gps_altitude_noise**2)
+            float(h_noise**2), 0.0, 0.0,
+            0.0, float(h_noise**2), 0.0,
+            0.0, 0.0, float(v_noise**2)
         ]
         gps_msg.position_covariance_type = 2  # Diagonal known
         

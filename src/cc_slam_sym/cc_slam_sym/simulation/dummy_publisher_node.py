@@ -50,11 +50,13 @@ class DummyPublisher(Node):
         self.declare_parameter('sensors.cone_detection.roi_type', 'sector')
         self.declare_parameter('sensors.noise.position_stddev', 0.05)
         
-        # Drift and bias parameters
-        self.declare_parameter('sensors.noise.imu_accel_bias_drift', 0.02)
-        self.declare_parameter('sensors.noise.imu_gyro_bias_drift', 0.001)
-        self.declare_parameter('sensors.noise.imu_accel_white_noise', 0.01)
-        self.declare_parameter('sensors.noise.imu_gyro_white_noise', 0.0017)
+        # IMU Allan variance parameters
+        self.declare_parameter('sensors.noise.imu_gyro_noise_density', 0.005)
+        self.declare_parameter('sensors.noise.imu_gyro_bias_stability', 0.1)
+        self.declare_parameter('sensors.noise.imu_gyro_random_walk', 0.00001)
+        self.declare_parameter('sensors.noise.imu_accel_noise_density', 0.01)
+        self.declare_parameter('sensors.noise.imu_accel_bias_stability', 0.01)
+        self.declare_parameter('sensors.noise.imu_accel_random_walk', 0.0001)
         # Per-axis drift parameters
         self.declare_parameter('sensors.noise.odom_drift_x.systematic', 0.0)
         self.declare_parameter('sensors.noise.odom_drift_x.random_stddev', 0.0)
@@ -63,9 +65,14 @@ class DummyPublisher(Node):
         self.declare_parameter('sensors.noise.odom_drift_theta.systematic', 0.0)
         self.declare_parameter('sensors.noise.odom_drift_theta.random_stddev', 0.0)
         
-        # GPS noise parameters
-        self.declare_parameter('sensors.noise.gps_position_noise', 0.015)
-        self.declare_parameter('sensors.noise.gps_altitude_noise', 0.1)
+        # GPS RTK mode parameters
+        self.declare_parameter('sensors.noise.gps_mode', 'rtk')
+        self.declare_parameter('sensors.noise.gps_rtk_fix_noise_h', 0.02)
+        self.declare_parameter('sensors.noise.gps_rtk_fix_noise_v', 0.04)
+        self.declare_parameter('sensors.noise.gps_rtk_float_noise_h', 0.3)
+        self.declare_parameter('sensors.noise.gps_rtk_float_noise_v', 0.5)
+        self.declare_parameter('sensors.noise.gps_single_noise_h', 2.0)
+        self.declare_parameter('sensors.noise.gps_single_noise_v', 5.0)
         
         # Detection error parameters
         self.declare_parameter('sensors.detection_errors.enable', True)
@@ -91,13 +98,21 @@ class DummyPublisher(Node):
         
         # Create sensor noise configuration
         noise_config = SensorNoiseConfig(
-            imu_accel_bias_drift=self.get_parameter('sensors.noise.imu_accel_bias_drift').value,
-            imu_gyro_bias_drift=self.get_parameter('sensors.noise.imu_gyro_bias_drift').value,
-            imu_accel_white_noise=self.get_parameter('sensors.noise.imu_accel_white_noise').value,
-            imu_gyro_white_noise=self.get_parameter('sensors.noise.imu_gyro_white_noise').value,
-            # GPS noise
-            gps_position_noise=self.get_parameter('sensors.noise.gps_position_noise').value,
-            gps_altitude_noise=self.get_parameter('sensors.noise.gps_altitude_noise').value,
+            # IMU Allan variance parameters
+            imu_gyro_noise_density=self.get_parameter('sensors.noise.imu_gyro_noise_density').value,
+            imu_gyro_bias_stability=self.get_parameter('sensors.noise.imu_gyro_bias_stability').value,
+            imu_gyro_random_walk=self.get_parameter('sensors.noise.imu_gyro_random_walk').value,
+            imu_accel_noise_density=self.get_parameter('sensors.noise.imu_accel_noise_density').value,
+            imu_accel_bias_stability=self.get_parameter('sensors.noise.imu_accel_bias_stability').value,
+            imu_accel_random_walk=self.get_parameter('sensors.noise.imu_accel_random_walk').value,
+            # GPS RTK mode parameters
+            gps_mode=self.get_parameter('sensors.noise.gps_mode').value,
+            gps_rtk_fix_noise_h=self.get_parameter('sensors.noise.gps_rtk_fix_noise_h').value,
+            gps_rtk_fix_noise_v=self.get_parameter('sensors.noise.gps_rtk_fix_noise_v').value,
+            gps_rtk_float_noise_h=self.get_parameter('sensors.noise.gps_rtk_float_noise_h').value,
+            gps_rtk_float_noise_v=self.get_parameter('sensors.noise.gps_rtk_float_noise_v').value,
+            gps_single_noise_h=self.get_parameter('sensors.noise.gps_single_noise_h').value,
+            gps_single_noise_v=self.get_parameter('sensors.noise.gps_single_noise_v').value,
             # Per-axis drift parameters
             odom_drift_x_systematic=self.get_parameter('sensors.noise.odom_drift_x.systematic').value,
             odom_drift_x_random=self.get_parameter('sensors.noise.odom_drift_x.random_stddev').value,
@@ -142,6 +157,8 @@ class DummyPublisher(Node):
         self.imu_pub = self.create_publisher(Imu, '/ouster/imu_sim', 10)
         self.gps_pub = self.create_publisher(NavSatFix, '/ublox_gps_node/fix_sim', 10)
         self.gps_vel_pub = self.create_publisher(TwistWithCovarianceStamped, '/ublox_gps_node/fix_velocity_sim', 10)
+        # Direct GPS odometry for robot_localization (bypasses navsat_transform)
+        self.gps_odom_pub = self.create_publisher(Odometry, '/gps/odom', 10)
         self.pose_pub = self.create_publisher(PoseStamped, '/robot/pose', 10)
         self.path_pub = self.create_publisher(Path, '/robot/path', 10)
         self.gt_cones_pub = self.create_publisher(MarkerArray, '/ground_truth_map_cones', gt_qos)
@@ -567,7 +584,7 @@ class DummyPublisher(Node):
     
     def publish_gps(self):
         """Publish GPS data using sensor simulator"""
-        # Generate GPS message
+        # Generate GPS message (for compatibility)
         gps_msg = self.sensor_sim.gps_sim.generate_gps_data(
             self.vehicle_state.position[0],
             self.vehicle_state.position[1],
@@ -577,24 +594,78 @@ class DummyPublisher(Node):
         
         self.gps_pub.publish(gps_msg)
         
-        # Also publish GPS velocity (simulated)
+        # Direct GPS odometry for robot_localization
+        gps_odom_msg = Odometry()
+        gps_odom_msg.header.stamp = self.get_clock().now().to_msg()
+        gps_odom_msg.header.frame_id = "odom"  # GPS in odom frame for EKF
+        gps_odom_msg.child_frame_id = "gps_link"
+        
+        # Get noise based on GPS mode
+        noise_config = self.sensor_sim.gps_sim.config
+        if noise_config.gps_mode == "rtk" or noise_config.gps_mode == "rtk_fix":
+            h_noise = noise_config.gps_rtk_fix_noise_h
+            v_noise = noise_config.gps_rtk_fix_noise_v
+        elif noise_config.gps_mode == "rtk_float":
+            h_noise = noise_config.gps_rtk_float_noise_h
+            v_noise = noise_config.gps_rtk_float_noise_v
+        elif noise_config.gps_mode == "dgps":
+            h_noise = (noise_config.gps_single_noise_h + noise_config.gps_rtk_float_noise_h) / 2
+            v_noise = (noise_config.gps_single_noise_v + noise_config.gps_rtk_float_noise_v) / 2
+        else:  # single
+            h_noise = noise_config.gps_single_noise_h
+            v_noise = noise_config.gps_single_noise_v
+        
+        # Apply noise to position
+        gps_odom_msg.pose.pose.position.x = self.vehicle_state.position[0] + np.random.normal(0, h_noise)
+        gps_odom_msg.pose.pose.position.y = self.vehicle_state.position[1] + np.random.normal(0, h_noise)
+        gps_odom_msg.pose.pose.position.z = self.vehicle_state.position[2] + np.random.normal(0, v_noise)
+        
+        # GPS doesn't provide orientation
+        gps_odom_msg.pose.pose.orientation.w = 1.0
+        
+        # Set covariances
+        pose_cov = np.zeros(36)
+        pose_cov[0] = h_noise**2  # x
+        pose_cov[7] = h_noise**2  # y
+        pose_cov[14] = v_noise**2  # z
+        # Large uncertainty for orientation (GPS doesn't measure it)
+        pose_cov[21] = 1e6  # roll
+        pose_cov[28] = 1e6  # pitch  
+        pose_cov[35] = 1e6  # yaw
+        gps_odom_msg.pose.covariance = pose_cov.tolist()
+        
+        # GPS velocity (optional)
+        gps_vel_noise = 0.1  # m/s
+        gps_odom_msg.twist.twist.linear.x = self.vehicle_state.linear_velocity[0] + np.random.normal(0, gps_vel_noise)
+        gps_odom_msg.twist.twist.linear.y = self.vehicle_state.linear_velocity[1] + np.random.normal(0, gps_vel_noise)
+        gps_odom_msg.twist.twist.linear.z = 0.0
+        
+        # Velocity covariance
+        twist_cov = np.zeros(36)
+        twist_cov[0] = gps_vel_noise**2  # vx
+        twist_cov[7] = gps_vel_noise**2  # vy
+        twist_cov[14] = 0.5**2  # vz (larger uncertainty)
+        # No angular velocity from GPS
+        twist_cov[21] = 1e6  # vroll
+        twist_cov[28] = 1e6  # vpitch
+        twist_cov[35] = 1e6  # vyaw
+        gps_odom_msg.twist.covariance = twist_cov.tolist()
+        
+        self.gps_odom_pub.publish(gps_odom_msg)
+        
+        # Also publish GPS velocity as separate message (for compatibility)
         gps_vel_msg = TwistWithCovarianceStamped()
         gps_vel_msg.header.stamp = self.get_clock().now().to_msg()
         gps_vel_msg.header.frame_id = "gps_link"
         
-        # GPS velocity in ENU frame
-        vel_magnitude = np.sqrt(
-            self.vehicle_state.linear_velocity[0]**2 + 
-            self.vehicle_state.linear_velocity[1]**2
-        )
-        gps_vel_msg.twist.twist.linear.x = self.vehicle_state.linear_velocity[0] + np.random.normal(0, 0.1)
-        gps_vel_msg.twist.twist.linear.y = self.vehicle_state.linear_velocity[1] + np.random.normal(0, 0.1)
+        gps_vel_msg.twist.twist.linear.x = gps_odom_msg.twist.twist.linear.x
+        gps_vel_msg.twist.twist.linear.y = gps_odom_msg.twist.twist.linear.y
         gps_vel_msg.twist.twist.linear.z = 0.0
         
         # Covariance
-        gps_vel_msg.twist.covariance[0] = 0.01  # vx
-        gps_vel_msg.twist.covariance[7] = 0.01  # vy
-        gps_vel_msg.twist.covariance[14] = 0.1  # vz
+        gps_vel_msg.twist.covariance[0] = gps_vel_noise**2  # vx
+        gps_vel_msg.twist.covariance[7] = gps_vel_noise**2  # vy
+        gps_vel_msg.twist.covariance[14] = 0.5**2  # vz
         
         self.gps_vel_pub.publish(gps_vel_msg)
     
