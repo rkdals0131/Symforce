@@ -55,26 +55,41 @@ class TrajectoryGenerator:
     @staticmethod
     def generate_formula_student_centerline(num_points: int = 400) -> List[Tuple[float, float]]:
         """Generate centerline for Formula Student elliptical track"""
+        # Use proven waypoints from successful implementation
+        base_waypoints = [
+            (35.0, 12.5), (88.0, 12.5),
+            (88.50, 12.00), (90.10, 6.72), (94.36, 3.22), (99.85, 2.68), (104.72, 5.28), 
+            (107.32, 10.15), (106.78, 15.64), (103.28, 19.90), (98.00, 21.50),
+            (95.0, 22.0), (80.0, 27.5),
+            (75.0, 27.5), (70.0, 27.5), (65.0, 27.5), (60.0, 27.5), (55.0, 27.5),
+            (50.0, 27.5), (45.0, 27.5), (40.0, 27.5), (35.0, 27.5), (30.0, 27.5),
+            (27.6, 26.6), (12.0, 21.5),
+            (12.00, 21.50), (6.72, 19.90), (3.22, 15.64), 
+            (2.68, 10.15), (5.28, 5.28), (10.15, 2.68), (15.64, 3.22), (19.90, 6.72), (21.50, 12.00),
+            (23.0, 12.5), (30.0, 12.5),
+        ]
+        
         points = []
-        
-        # Track parameters (matching cone_definitions.py)
-        straight_length = 50.0
-        curve_radius = 20.0
-        track_width = 3.0
-        
-        # Generate elliptical path
-        for i in range(num_points):
-            t = 2 * np.pi * i / num_points
+        # Interpolate between waypoints for smoother path
+        for i in range(len(base_waypoints)):
+            current = base_waypoints[i]
+            next_wp = base_waypoints[(i + 1) % len(base_waypoints)]
             
-            # Basic ellipse
-            a = straight_length / 2 + curve_radius  # Semi-major axis
-            b = curve_radius  # Semi-minor axis
+            # Add current waypoint
+            points.append(current)
             
-            # Parametric ellipse
-            x = a * np.cos(t)
-            y = b * np.sin(t)
+            # Interpolate between current and next
+            dx = next_wp[0] - current[0]
+            dy = next_wp[1] - current[1]
+            distance = np.sqrt(dx**2 + dy**2)
             
-            points.append((x, y))
+            # Add interpolated points every 0.5 meters
+            num_interp = int(distance / 0.5)
+            for j in range(1, num_interp):
+                t = j / float(num_interp)
+                x = current[0] + t * dx
+                y = current[1] + t * dy
+                points.append((x, y))
         
         return points
     
@@ -130,13 +145,28 @@ class MotionController:
         # Smooth the centerline
         self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline)
         
-        # Current position along centerline
-        self.centerline_index = 0
+        # Initialize vehicle state based on scenario
+        if scenario == MotionScenario.STRAIGHT_TRACK:
+            # Scenario 1: Start at beginning of track
+            initial_pos = np.array([0.0, 0.0, 0.0])
+            self.centerline_index = 0
+        else:
+            # Scenario 2: Start at specific position
+            initial_pos = np.array([30.0, 12.5, 0.0])
+            # Find closest centerline point
+            min_dist = float('inf')
+            closest_idx = 0
+            for i, point in enumerate(self.centerline):
+                dist = np.sqrt((point[0] - initial_pos[0])**2 + (point[1] - initial_pos[1])**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            self.centerline_index = closest_idx
+        
         self.distance_along_segment = 0.0
         
-        # Initialize vehicle state
         self.state = VehicleState(
-            position=np.array([self.centerline[0][0], self.centerline[0][1], 0.0]),
+            position=initial_pos,
             orientation=np.array([0.0, 0.0, 0.0]),
             linear_velocity=np.array([0.0, 0.0, 0.0]),
             angular_velocity=np.array([0.0, 0.0, 0.0]),
@@ -321,8 +351,14 @@ class MotionController:
         self.centerline_index = 0
         self.distance_along_segment = 0.0
         
+        # Reset to initial position based on scenario
+        if self.scenario == MotionScenario.STRAIGHT_TRACK:
+            initial_pos = np.array([0.0, 0.0, 0.0])
+        else:
+            initial_pos = np.array([30.0, 12.5, 0.0])
+        
         self.state = VehicleState(
-            position=np.array([self.centerline[0][0], self.centerline[0][1], 0.0]),
+            position=initial_pos,
             orientation=np.array([0.0, 0.0, 0.0]),
             linear_velocity=np.array([0.0, 0.0, 0.0]),
             angular_velocity=np.array([0.0, 0.0, 0.0]),

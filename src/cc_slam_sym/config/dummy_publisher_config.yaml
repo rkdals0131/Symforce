@@ -16,6 +16,12 @@ dummy_publisher:
     vehicle:
       speed: 5.0              # 미터/초 - 기본 전진 속도
       
+    # 오도메트리 시뮬레이션 설정
+    odometry_simulation:
+      enable: true           # 내부 오도메트리 시뮬레이션 활성화 여부
+                             # false: robot_localization 등 외부 odometry 사용
+                             # true: 내부 시뮬레이터로 noisy odometry 생성
+      
     # 센서 시뮬레이션
     sensors:
       # 콘 감지 파라미터
@@ -37,8 +43,8 @@ dummy_publisher:
         imu_gyro_white_noise: 0.0002    # 라디안/초 - 자이로스코프 백색 잡음 (순간 노이즈)
         
         # 오도메트리 누적 드리프트
-        odom_drift_rate_linear: 0.5     # 미터당 % - 선형 이동 시 누적 드리프트 비율
-        odom_drift_rate_angular: 0.2    # 라디안당 % - 회전 시 누적 드리프트 비율
+        odom_drift_rate_linear: 15.5     # 미터당 % - 선형 이동 시 누적 드리프트 비율
+        odom_drift_rate_angular: 15.2    # 라디안당 % - 회전 시 누적 드리프트 비율
         
       # 감지 오류 시뮬레이션 (LiDAR + 카메라 융합 문제)
       detection_errors:

@@ -43,6 +43,7 @@ class DummyPublisher(Node):
         self.declare_parameter('publish_rates.imu', 100.0)
         self.declare_parameter('publish_rates.gps', 8.0)
         self.declare_parameter('vehicle.speed', 5.0)
+        self.declare_parameter('odometry_simulation.enable', True)
         self.declare_parameter('sensors.cone_detection.max_range', 15.0)
         self.declare_parameter('sensors.cone_detection.fov_deg', 120.0)
         self.declare_parameter('sensors.cone_detection.roi_type', 'sector')
@@ -55,8 +56,8 @@ class DummyPublisher(Node):
         self.declare_parameter('sensors.noise.imu_gyro_bias_drift', 0.001)
         self.declare_parameter('sensors.noise.imu_accel_white_noise', 0.01)
         self.declare_parameter('sensors.noise.imu_gyro_white_noise', 0.0017)
-        self.declare_parameter('sensors.noise.odom_drift_rate_linear', 0.02)
-        self.declare_parameter('sensors.noise.odom_drift_rate_angular', 0.01)
+        self.declare_parameter('sensors.noise.odom_drift_rate_linear', 0.5)
+        self.declare_parameter('sensors.noise.odom_drift_rate_angular', 0.2)
         
         # Detection error parameters
         self.declare_parameter('sensors.detection_errors.enable', True)
@@ -71,6 +72,7 @@ class DummyPublisher(Node):
         self.imu_rate = self.get_parameter('publish_rates.imu').value
         self.gps_rate = self.get_parameter('publish_rates.gps').value
         self.vehicle_speed = self.get_parameter('vehicle.speed').value
+        self.odom_sim_enabled = self.get_parameter('odometry_simulation.enable').value
         self.detection_range = self.get_parameter('sensors.cone_detection.max_range').value
         self.fov_rad = np.radians(self.get_parameter('sensors.cone_detection.fov_deg').value)
         self.roi_type = self.get_parameter('sensors.cone_detection.roi_type').value
@@ -186,7 +188,9 @@ class DummyPublisher(Node):
         empty_markers.markers.append(delete_all)
         self.detected_cones_vis_pub.publish(empty_markers)
         
+        # Log configuration
         self.get_logger().info("Dummy publisher initialized (refactored version)")
+        self.get_logger().info(f"Odometry simulation: {'ENABLED' if self.odom_sim_enabled else 'DISABLED (use external odometry)'}")
     
     def update_motion(self):
         """Update robot motion using motion controller"""
@@ -225,55 +229,98 @@ class DummyPublisher(Node):
         self.pose_pub.publish(pose_stamped)
     
     def publish_transforms(self):
-        """Publish TF transforms"""
-        now = self.get_clock().now()
+        """Publish TF transforms including ground truth and noisy odometry"""
+        now = self.get_clock().now().to_msg()
+        transforms = []
         
-        # Map -> Ground truth base_link (perfect)
-        t = TransformStamped()
-        t.header.stamp = now.to_msg()
-        t.header.frame_id = "map"
-        t.child_frame_id = "ground_truth_base_link"
-        t.transform.translation.x = self.vehicle_state.position[0]
-        t.transform.translation.y = self.vehicle_state.position[1]
-        t.transform.translation.z = self.vehicle_state.position[2]
+        # Map -> Ground_truth_odom (identity - ground truth has no drift)
+        map_to_gt_odom = TransformStamped()
+        map_to_gt_odom.header.stamp = now
+        map_to_gt_odom.header.frame_id = "map"
+        map_to_gt_odom.child_frame_id = "ground_truth_odom"
+        map_to_gt_odom.transform.rotation.w = 1.0
+        transforms.append(map_to_gt_odom)
         
-        q = quaternion_from_euler(
+        # Ground_truth_odom -> Ground_truth_base_link
+        gt_odom_to_gt_base = TransformStamped()
+        gt_odom_to_gt_base.header.stamp = now
+        gt_odom_to_gt_base.header.frame_id = "ground_truth_odom"
+        gt_odom_to_gt_base.child_frame_id = "ground_truth_base_link"
+        gt_odom_to_gt_base.transform.translation.x = self.vehicle_state.position[0]
+        gt_odom_to_gt_base.transform.translation.y = self.vehicle_state.position[1]
+        gt_odom_to_gt_base.transform.translation.z = self.vehicle_state.position[2]
+        
+        q_gt = quaternion_from_euler(
             self.vehicle_state.orientation[0],
             self.vehicle_state.orientation[1],
             self.vehicle_state.orientation[2]
         )
-        t.transform.rotation.x = q[0]
-        t.transform.rotation.y = q[1]
-        t.transform.rotation.z = q[2]
-        t.transform.rotation.w = q[3]
+        gt_odom_to_gt_base.transform.rotation.x = q_gt[0]
+        gt_odom_to_gt_base.transform.rotation.y = q_gt[1]
+        gt_odom_to_gt_base.transform.rotation.z = q_gt[2]
+        gt_odom_to_gt_base.transform.rotation.w = q_gt[3]
+        transforms.append(gt_odom_to_gt_base)
         
-        self.tf_broadcaster.sendTransform(t)
+        # Map -> Odom transform (identity for now - SLAM will update this)
+        map_to_odom = TransformStamped()
+        map_to_odom.header.stamp = now
+        map_to_odom.header.frame_id = "map"
+        map_to_odom.child_frame_id = "odom"
+        map_to_odom.transform.rotation.w = 1.0
+        transforms.append(map_to_odom)
         
-        # Ground truth base_link -> sensors (fixed transforms)
-        # IMU link
-        t_imu = TransformStamped()
-        t_imu.header.stamp = now.to_msg()
-        t_imu.header.frame_id = "ground_truth_base_link"
-        t_imu.child_frame_id = "imu_link"
-        t_imu.transform.translation.x = 0.0
-        t_imu.transform.translation.y = 0.0
-        t_imu.transform.translation.z = 0.3
-        t_imu.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(t_imu)
+        # Odom -> Base_link transform (only if odom simulation is enabled)
+        if self.odom_sim_enabled:
+            # Apply same noise as odometry messages (drift + white noise)
+            import numpy as np
+            position_noise = self.sensor_sim.odom_sim.config.odom_position_noise
+            angle_noise = self.sensor_sim.odom_sim.config.odom_angle_noise
+            
+            noisy_x = (self.vehicle_state.position[0] + self.sensor_sim.odom_sim.drift_x + 
+                       np.random.normal(0, position_noise))
+            noisy_y = (self.vehicle_state.position[1] + self.sensor_sim.odom_sim.drift_y + 
+                       np.random.normal(0, position_noise))
+            noisy_theta = (self.vehicle_state.orientation[2] + self.sensor_sim.odom_sim.drift_theta + 
+                           np.random.normal(0, angle_noise))
+            
+            # Odom -> Base_link transform (noisy)
+            odom_to_base = TransformStamped()
+            odom_to_base.header.stamp = now
+            odom_to_base.header.frame_id = "odom"
+            odom_to_base.child_frame_id = "base_link"
+            odom_to_base.transform.translation.x = noisy_x
+            odom_to_base.transform.translation.y = noisy_y
+            odom_to_base.transform.translation.z = 0.0
+            
+            q = quaternion_from_euler(0, 0, noisy_theta)
+            odom_to_base.transform.rotation.x = q[0]
+            odom_to_base.transform.rotation.y = q[1]
+            odom_to_base.transform.rotation.z = q[2]
+            odom_to_base.transform.rotation.w = q[3]
+            transforms.append(odom_to_base)
+        # If odom simulation is disabled, robot_localization will provide odom->base_link
         
-        # GPS link
-        t_gps = TransformStamped()
-        t_gps.header.stamp = now.to_msg()
-        t_gps.header.frame_id = "ground_truth_base_link"
-        t_gps.child_frame_id = "gps_link"
-        t_gps.transform.translation.x = -0.5
-        t_gps.transform.translation.y = 0.0
-        t_gps.transform.translation.z = 0.5
-        t_gps.transform.rotation.w = 1.0
-        self.tf_broadcaster.sendTransform(t_gps)
+        # Base_link -> IMU_link
+        base_to_imu = TransformStamped()
+        base_to_imu.header.stamp = now
+        base_to_imu.header.frame_id = "base_link"
+        base_to_imu.child_frame_id = "imu_link"
+        base_to_imu.transform.translation.z = 0.3
+        base_to_imu.transform.rotation.w = 1.0
+        transforms.append(base_to_imu)
         
-        # Note: We don't publish map->base_link transform as that's typically
-        # done by a localization system (e.g., robot_localization package)
+        # Base_link -> GPS_link
+        base_to_gps = TransformStamped()
+        base_to_gps.header.stamp = now
+        base_to_gps.header.frame_id = "base_link"
+        base_to_gps.child_frame_id = "gps_link"
+        base_to_gps.transform.translation.x = -0.5
+        base_to_gps.transform.translation.z = 0.5
+        base_to_gps.transform.rotation.w = 1.0
+        transforms.append(base_to_gps)
+        
+        # Broadcast all transforms
+        self.tf_broadcaster.sendTransform(transforms)
     
     def publish_ground_truth_cones(self):
         """Publish ground truth cone positions for visualization"""
@@ -290,8 +337,9 @@ class DummyPublisher(Node):
             cones_list,
             namespace="ground_truth_cones",
             frame_id="map",
-            with_text=True,
-            timestamp=self.get_clock().now()
+            with_text=False,  # GT cone에는 텍스트 제거
+            timestamp=self.get_clock().now(),
+            ground_truth=True
         )
     
     def publish_cones(self):
@@ -478,6 +526,8 @@ class DummyPublisher(Node):
     
     def publish_detected_cones_visualization(self):
         """Publish visualization of detected cones"""
+        if self.last_detected_cones:
+            self.get_logger().debug(f"Publishing {len(self.last_detected_cones)} detected cones")
         publish_detected_cones(
             self.detected_cones_vis_pub,
             self.last_detected_cones,
@@ -538,31 +588,38 @@ class DummyPublisher(Node):
         
         self.gps_vel_pub.publish(gps_vel_msg)
         
-        # Publish odometry with drift
-        dt = 1.0 / self.gps_rate
-        odom_msg = self.sensor_sim.odom_sim.generate_odometry_data(
-            self.vehicle_state.position[0],
-            self.vehicle_state.position[1],
-            self.vehicle_state.orientation[2],
-            self.vehicle_state.linear_velocity[0],
-            self.vehicle_state.linear_velocity[1],
-            self.vehicle_state.angular_velocity[2],
-            dt,
-            self.get_clock().now()
-        )
-        
-        self.odom_pub.publish(odom_msg)
-        
-        # Update path with noisy odometry
-        pose_stamped = PoseStamped()
-        pose_stamped.header = odom_msg.header
-        pose_stamped.pose = odom_msg.pose.pose
-        
-        self.path.poses.append(pose_stamped)
-        if len(self.path.poses) > 1000:  # Limit path length
-            self.path.poses.pop(0)
-        
-        self.path_pub.publish(self.path)
+        # Publish odometry with drift only if enabled
+        if self.odom_sim_enabled:
+            dt = 1.0 / self.gps_rate
+            odom_msg = self.sensor_sim.odom_sim.generate_odometry_data(
+                self.vehicle_state.position[0],
+                self.vehicle_state.position[1],
+                self.vehicle_state.orientation[2],
+                self.vehicle_state.linear_velocity[0],
+                self.vehicle_state.linear_velocity[1],
+                self.vehicle_state.angular_velocity[2],
+                dt,
+                self.get_clock().now()
+            )
+            
+            self.odom_pub.publish(odom_msg)
+            
+            # Update path with noisy odometry
+            pose_stamped = PoseStamped()
+            pose_stamped.header = odom_msg.header
+            pose_stamped.pose = odom_msg.pose.pose
+            
+            self.path.poses.append(pose_stamped)
+            if len(self.path.poses) > 1000:  # Limit path length
+                self.path.poses.pop(0)
+            
+            self.path_pub.publish(self.path)
+        else:
+            # Log only once using a flag
+            if not hasattr(self, '_odom_disabled_logged'):
+                self.get_logger().info("Odometry simulation disabled - use external odometry source")
+                self._odom_disabled_logged = True
+            # Path will be updated by external odometry subscriber if needed
 
 
 def main(args=None):

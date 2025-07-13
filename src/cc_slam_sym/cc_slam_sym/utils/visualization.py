@@ -25,13 +25,12 @@ class VisualizationHelper:
         'green': (0.0, 1.0, 0.0, 0.8),  # For unknown cones
         'white': (1.0, 1.0, 1.0, 0.8),
         'purple': (0.5, 0.0, 0.5, 0.8),
-        'orange': (1.0, 0.5, 0.0, 0.8),
     }
     
     @staticmethod
     def create_cone_marker(position: np.ndarray, color: str, marker_id: int, 
                           namespace: str = "cones", frame_id: str = "map",
-                          timestamp: Optional[object] = None) -> Marker:
+                          timestamp: Optional[object] = None, ground_truth: bool = False) -> Marker:
         """Create a cone marker (cylinder)"""
         marker = Marker()
         
@@ -60,11 +59,19 @@ class VisualizationHelper:
         marker.scale.z = 0.3  # Height
         
         # Color
-        color_tuple = VisualizationHelper.COLORS.get(color.lower(), (0.5, 0.5, 0.5, 0.8))
-        marker.color.r = color_tuple[0]
-        marker.color.g = color_tuple[1]
-        marker.color.b = color_tuple[2]
-        marker.color.a = color_tuple[3]
+        if ground_truth:
+            # Semi-transparent gray for ground truth cones
+            marker.color.r = 0.5
+            marker.color.g = 0.5
+            marker.color.b = 0.5
+            marker.color.a = 0.3
+        else:
+            # Normal colors for detected cones
+            color_tuple = VisualizationHelper.COLORS.get(color.lower(), (0.5, 0.5, 0.5, 0.8))
+            marker.color.r = color_tuple[0]
+            marker.color.g = color_tuple[1]
+            marker.color.b = color_tuple[2]
+            marker.color.a = color_tuple[3]
         
         # Lifetime (0 = forever)
         marker.lifetime = rclpy.duration.Duration(seconds=0).to_msg()
@@ -241,7 +248,7 @@ class VisualizationHelper:
 
 def publish_cone_array(publisher, cones: List[Dict], namespace: str = "cones",
                       frame_id: str = "map", with_text: bool = False,
-                      timestamp: Optional[object] = None) -> None:
+                      timestamp: Optional[object] = None, ground_truth: bool = False) -> None:
     """
     Publish an array of cones with optional text labels
     
@@ -272,7 +279,8 @@ def publish_cone_array(publisher, cones: List[Dict], namespace: str = "cones",
             marker_id=idx,
             namespace=namespace,
             frame_id=frame_id,
-            timestamp=timestamp
+            timestamp=timestamp,
+            ground_truth=ground_truth
         )
         marker_array.markers.append(cone_marker)
         

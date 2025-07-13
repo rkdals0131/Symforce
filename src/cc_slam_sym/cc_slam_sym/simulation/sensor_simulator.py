@@ -255,12 +255,14 @@ class OdometrySimulator:
         if distance_moved > 0:
             drift_magnitude = distance_moved * self.config.odom_drift_rate_linear * 0.01
             drift_angle = np.random.uniform(0, 2 * np.pi)
-            self.drift_x += drift_magnitude * np.cos(drift_angle) * np.random.normal(0, 0.5)
-            self.drift_y += drift_magnitude * np.sin(drift_angle) * np.random.normal(0, 0.5)
+            # Fixed: Remove random multiplier that can cancel out drift
+            self.drift_x += drift_magnitude * np.cos(drift_angle)
+            self.drift_y += drift_magnitude * np.sin(drift_angle)
         
         # Angular drift proportional to rotation
         if abs(angle_rotated) > 0:
-            self.drift_theta += angle_rotated * self.config.odom_drift_rate_angular * 0.01 * np.random.normal(0, 0.5)
+            # Fixed: Consistent drift accumulation direction
+            self.drift_theta += angle_rotated * self.config.odom_drift_rate_angular * 0.01
         
         # Update totals
         self.total_distance += distance_moved
@@ -289,6 +291,17 @@ class OdometrySimulator:
         
         # Update cumulative drift
         self.update_drift(distance_moved, angle_rotated)
+        
+        # Debug: Print drift values periodically
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 0
+            
+        if self._debug_counter % 50 == 0:
+            print(f"DEBUG DRIFT: x={self.drift_x:.6f}, y={self.drift_y:.6f}, theta={self.drift_theta:.6f}, "
+                  f"dist_moved={distance_moved:.6f}, angle_rot={angle_rotated:.6f}, total_dist={self.total_distance:.2f}, "
+                  f"drift_rates=[{self.config.odom_drift_rate_linear}, {self.config.odom_drift_rate_angular}]")
         
         # Create odometry message
         odom_msg = Odometry()
