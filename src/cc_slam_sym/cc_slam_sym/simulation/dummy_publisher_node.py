@@ -42,22 +42,30 @@ class DummyPublisher(Node):
         self.declare_parameter('publish_rates.cones', 20.0)
         self.declare_parameter('publish_rates.imu', 100.0)
         self.declare_parameter('publish_rates.gps', 8.0)
+        self.declare_parameter('publish_rates.odometry', 100.0)
         self.declare_parameter('vehicle.speed', 5.0)
         self.declare_parameter('odometry_simulation.enable', True)
         self.declare_parameter('sensors.cone_detection.max_range', 15.0)
         self.declare_parameter('sensors.cone_detection.fov_deg', 120.0)
         self.declare_parameter('sensors.cone_detection.roi_type', 'sector')
         self.declare_parameter('sensors.noise.position_stddev', 0.05)
-        self.declare_parameter('sensors.noise.odom_position', 0.1)
-        self.declare_parameter('sensors.noise.odom_angle', 0.05)
         
         # Drift and bias parameters
         self.declare_parameter('sensors.noise.imu_accel_bias_drift', 0.02)
         self.declare_parameter('sensors.noise.imu_gyro_bias_drift', 0.001)
         self.declare_parameter('sensors.noise.imu_accel_white_noise', 0.01)
         self.declare_parameter('sensors.noise.imu_gyro_white_noise', 0.0017)
-        self.declare_parameter('sensors.noise.odom_drift_rate_linear', 0.5)
-        self.declare_parameter('sensors.noise.odom_drift_rate_angular', 0.2)
+        # Per-axis drift parameters
+        self.declare_parameter('sensors.noise.odom_drift_x.systematic', 0.0)
+        self.declare_parameter('sensors.noise.odom_drift_x.random_stddev', 0.0)
+        self.declare_parameter('sensors.noise.odom_drift_y.systematic', 0.0)
+        self.declare_parameter('sensors.noise.odom_drift_y.random_stddev', 0.0)
+        self.declare_parameter('sensors.noise.odom_drift_theta.systematic', 0.0)
+        self.declare_parameter('sensors.noise.odom_drift_theta.random_stddev', 0.0)
+        
+        # GPS noise parameters
+        self.declare_parameter('sensors.noise.gps_position_noise', 0.015)
+        self.declare_parameter('sensors.noise.gps_altitude_noise', 0.1)
         
         # Detection error parameters
         self.declare_parameter('sensors.detection_errors.enable', True)
@@ -71,6 +79,7 @@ class DummyPublisher(Node):
         self.publish_rate = self.get_parameter('publish_rates.cones').value
         self.imu_rate = self.get_parameter('publish_rates.imu').value
         self.gps_rate = self.get_parameter('publish_rates.gps').value
+        self.odom_rate = self.get_parameter('publish_rates.odometry').value
         self.vehicle_speed = self.get_parameter('vehicle.speed').value
         self.odom_sim_enabled = self.get_parameter('odometry_simulation.enable').value
         self.detection_range = self.get_parameter('sensors.cone_detection.max_range').value
@@ -86,10 +95,16 @@ class DummyPublisher(Node):
             imu_gyro_bias_drift=self.get_parameter('sensors.noise.imu_gyro_bias_drift').value,
             imu_accel_white_noise=self.get_parameter('sensors.noise.imu_accel_white_noise').value,
             imu_gyro_white_noise=self.get_parameter('sensors.noise.imu_gyro_white_noise').value,
-            odom_position_noise=self.get_parameter('sensors.noise.odom_position').value,
-            odom_angle_noise=self.get_parameter('sensors.noise.odom_angle').value,
-            odom_drift_rate_linear=self.get_parameter('sensors.noise.odom_drift_rate_linear').value,
-            odom_drift_rate_angular=self.get_parameter('sensors.noise.odom_drift_rate_angular').value
+            # GPS noise
+            gps_position_noise=self.get_parameter('sensors.noise.gps_position_noise').value,
+            gps_altitude_noise=self.get_parameter('sensors.noise.gps_altitude_noise').value,
+            # Per-axis drift parameters
+            odom_drift_x_systematic=self.get_parameter('sensors.noise.odom_drift_x.systematic').value,
+            odom_drift_x_random=self.get_parameter('sensors.noise.odom_drift_x.random_stddev').value,
+            odom_drift_y_systematic=self.get_parameter('sensors.noise.odom_drift_y.systematic').value,
+            odom_drift_y_random=self.get_parameter('sensors.noise.odom_drift_y.random_stddev').value,
+            odom_drift_theta_systematic=self.get_parameter('sensors.noise.odom_drift_theta.systematic').value,
+            odom_drift_theta_random=self.get_parameter('sensors.noise.odom_drift_theta.random_stddev').value
         )
         
         # Get detection error parameters
@@ -168,6 +183,8 @@ class DummyPublisher(Node):
         self.cone_timer = self.create_timer(1.0 / self.publish_rate, self.publish_cones)
         self.imu_timer = self.create_timer(1.0 / self.imu_rate, self.publish_imu)
         self.gps_timer = self.create_timer(1.0 / self.gps_rate, self.publish_gps)
+        if self.odom_sim_enabled:
+            self.odom_timer = self.create_timer(1.0 / self.odom_rate, self.publish_odometry)
         self.motion_timer = self.create_timer(0.01, self.update_motion)  # 100Hz motion update
         self.gt_timer = self.create_timer(1.0, self.publish_ground_truth_cones)  # 1Hz for ground truth
         self.roi_timer = self.create_timer(0.1, self.publish_roi)  # 10Hz for ROI
@@ -271,15 +288,10 @@ class DummyPublisher(Node):
         
         # Odom -> Base_link transform (only if odom simulation is enabled)
         if self.odom_sim_enabled:
-            # Use the odometry simulator's internal state
-            import numpy as np
-            position_noise = self.sensor_sim.odom_sim.config.odom_position_noise
-            angle_noise = self.sensor_sim.odom_sim.config.odom_angle_noise
-            
-            # Use odometry's estimated position (already includes drift)
-            noisy_x = self.sensor_sim.odom_sim.odom_x + np.random.normal(0, position_noise)
-            noisy_y = self.sensor_sim.odom_sim.odom_y + np.random.normal(0, position_noise)
-            noisy_theta = self.sensor_sim.odom_sim.odom_theta + np.random.normal(0, angle_noise)
+            # Use the odometry simulator's internal state (already includes drift)
+            noisy_x = self.sensor_sim.odom_sim.odom_x
+            noisy_y = self.sensor_sim.odom_sim.odom_y
+            noisy_theta = self.sensor_sim.odom_sim.odom_theta
             
             # Odom -> Base_link transform (noisy)
             odom_to_base = TransformStamped()
@@ -585,39 +597,36 @@ class DummyPublisher(Node):
         gps_vel_msg.twist.covariance[14] = 0.1  # vz
         
         self.gps_vel_pub.publish(gps_vel_msg)
+    
+    def publish_odometry(self):
+        """Publish odometry data at specified rate"""
+        if not self.odom_sim_enabled:
+            return
+            
+        dt = 1.0 / self.odom_rate
+        odom_msg = self.sensor_sim.odom_sim.generate_odometry_data(
+            self.vehicle_state.position[0],
+            self.vehicle_state.position[1],
+            self.vehicle_state.orientation[2],
+            self.vehicle_state.linear_velocity[0],
+            self.vehicle_state.linear_velocity[1],
+            self.vehicle_state.angular_velocity[2],
+            dt,
+            self.get_clock().now()
+        )
         
-        # Publish odometry with drift only if enabled
-        if self.odom_sim_enabled:
-            dt = 1.0 / self.gps_rate
-            odom_msg = self.sensor_sim.odom_sim.generate_odometry_data(
-                self.vehicle_state.position[0],
-                self.vehicle_state.position[1],
-                self.vehicle_state.orientation[2],
-                self.vehicle_state.linear_velocity[0],
-                self.vehicle_state.linear_velocity[1],
-                self.vehicle_state.angular_velocity[2],
-                dt,
-                self.get_clock().now()
-            )
-            
-            self.odom_pub.publish(odom_msg)
-            
-            # Update path with noisy odometry
-            pose_stamped = PoseStamped()
-            pose_stamped.header = odom_msg.header
-            pose_stamped.pose = odom_msg.pose.pose
-            
-            self.path.poses.append(pose_stamped)
-            if len(self.path.poses) > 1000:  # Limit path length
-                self.path.poses.pop(0)
-            
-            self.path_pub.publish(self.path)
-        else:
-            # Log only once using a flag
-            if not hasattr(self, '_odom_disabled_logged'):
-                self.get_logger().info("Odometry simulation disabled - use external odometry source")
-                self._odom_disabled_logged = True
-            # Path will be updated by external odometry subscriber if needed
+        self.odom_pub.publish(odom_msg)
+        
+        # Update path with noisy odometry
+        pose_stamped = PoseStamped()
+        pose_stamped.header = odom_msg.header
+        pose_stamped.pose = odom_msg.pose.pose
+        
+        self.path.poses.append(pose_stamped)
+        if len(self.path.poses) > 1000:  # Limit path length
+            self.path.poses.pop(0)
+        
+        self.path_pub.publish(self.path)
 
 
 def main(args=None):

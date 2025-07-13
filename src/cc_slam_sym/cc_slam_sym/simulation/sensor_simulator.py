@@ -11,12 +11,10 @@ Includes drift, bias, and white noise simulation for realistic sensor behavior.
 """
 
 import numpy as np
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Dict
 from dataclasses import dataclass
 from sensor_msgs.msg import Imu, NavSatFix
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Quaternion, Vector3, Point, Pose, Twist, TwistWithCovariance, PoseWithCovariance
-from std_msgs.msg import Header
 from tf_transformations import quaternion_from_euler
 import rclpy.time
 
@@ -30,11 +28,17 @@ class SensorNoiseConfig:
     imu_accel_white_noise: float = 0.002   # m/s² - 가속도계 백색 잡음
     imu_gyro_white_noise: float = 0.0002   # rad/s - 자이로스코프 백색 잡음
     
-    # Odometry parameters
-    odom_position_noise: float = 0.1       # m - 오도메트리 위치 노이즈
-    odom_angle_noise: float = 0.05         # rad - 오도메트리 각도 노이즈
-    odom_drift_rate_linear: float = 0.5    # % per meter - 선형 이동 누적 드리프트
-    odom_drift_rate_angular: float = 0.2   # % per radian - 회전 누적 드리프트
+    # GPS parameters
+    gps_position_noise: float = 2.0        # m - GPS 위치 노이즈
+    gps_altitude_noise: float = 5.0        # m - GPS 고도 노이즈
+    
+    # Odometry drift parameters (x, y, theta)
+    odom_drift_x_systematic: float = 0.0       # % - x축 bias (systematic error)
+    odom_drift_x_random: float = 0.0           # m - x축 random noise stddev
+    odom_drift_y_systematic: float = 0.0       # % - y축 bias (systematic error)
+    odom_drift_y_random: float = 0.0           # m - y축 random noise stddev
+    odom_drift_theta_systematic: float = 0.0   # % - theta bias (systematic error)
+    odom_drift_theta_random: float = 0.0       # rad - theta random noise stddev
 
 
 class ImuSimulator:
@@ -163,20 +167,18 @@ class ImuSimulator:
 class GpsSimulator:
     """Simulates GPS sensor data with realistic noise"""
     
-    def __init__(self, origin_lat: float = 37.5665, origin_lon: float = 126.9780):
+    def __init__(self, config: SensorNoiseConfig, origin_lat: float = 37.5665, origin_lon: float = 126.9780):
         """
         Initialize GPS simulator
         
         Args:
+            config: Sensor noise configuration
             origin_lat: Origin latitude (default: Seoul)
             origin_lon: Origin longitude (default: Seoul)
         """
+        self.config = config
         self.origin_lat = origin_lat
         self.origin_lon = origin_lon
-        
-        # GPS noise parameters
-        self.position_noise = 2.0  # meters (typical GPS accuracy)
-        self.altitude_noise = 5.0  # meters (GPS altitude is less accurate)
     
     def xy_to_latlon(self, x: float, y: float) -> Tuple[float, float]:
         """Convert local XY coordinates to latitude/longitude"""
@@ -203,9 +205,9 @@ class GpsSimulator:
             NavSatFix message with GPS noise
         """
         # Add noise to position
-        noisy_x = true_x + np.random.normal(0, self.position_noise)
-        noisy_y = true_y + np.random.normal(0, self.position_noise)
-        noisy_z = true_z + np.random.normal(0, self.altitude_noise)
+        noisy_x = true_x + np.random.normal(0, self.config.gps_position_noise)
+        noisy_y = true_y + np.random.normal(0, self.config.gps_position_noise)
+        noisy_z = true_z + np.random.normal(0, self.config.gps_altitude_noise)
         
         # Convert to lat/lon
         lat, lon = self.xy_to_latlon(noisy_x, noisy_y)
@@ -225,9 +227,9 @@ class GpsSimulator:
         
         # Position covariance (m²) - must be exactly 9 floats
         gps_msg.position_covariance = [
-            float(self.position_noise**2), 0.0, 0.0,
-            0.0, float(self.position_noise**2), 0.0,
-            0.0, 0.0, float(self.altitude_noise**2)
+            float(self.config.gps_position_noise**2), 0.0, 0.0,
+            0.0, float(self.config.gps_position_noise**2), 0.0,
+            0.0, 0.0, float(self.config.gps_altitude_noise**2)
         ]
         gps_msg.position_covariance_type = 2  # Diagonal known
         
@@ -306,30 +308,39 @@ class OdometrySimulator:
         # Calculate distance moved for drift computation
         distance_moved = np.sqrt(delta_x_local**2 + delta_y_local**2)
         
-        # Apply drift to the movement
-        # Linear drift: proportional to distance moved
+        # Apply drift to the movement (per-axis control)
+        # IMPORTANT: Bias should create drift even during straight motion!
+        
+        # X-axis drift (전진 방향)
         if distance_moved > 0:
-            # Add systematic drift (bias)
-            drift_factor_linear = 1.0 + self.config.odom_drift_rate_linear * 0.01
-            delta_x_local *= drift_factor_linear
-            delta_y_local *= drift_factor_linear
+            # Apply systematic bias (as % of movement)
+            delta_x_local *= (1.0 + self.config.odom_drift_x_systematic * 0.01)
+            # Add random noise
+            delta_x_local += np.random.normal(0, self.config.odom_drift_x_random)
+        
+        # Y-axis drift (측면 방향) - FIXED: Apply even when delta_y_local is 0!
+        if distance_moved > 0:
+            # Systematic bias: sideways drift proportional to forward movement
+            # (like a car with bad alignment drifting sideways)
+            sideways_drift = distance_moved * self.config.odom_drift_y_systematic * 0.01
+            delta_y_local += sideways_drift
+            # Add random noise
+            delta_y_local += np.random.normal(0, self.config.odom_drift_y_random)
+        
+        # Theta drift (heading) - Apply proportional to movement
+        if distance_moved > 0 or abs(delta_theta) > 0:
+            # Systematic bias on actual rotation
+            if abs(delta_theta) > 0:
+                delta_theta *= (1.0 + self.config.odom_drift_theta_systematic * 0.01)
             
-            # Add random drift component
-            drift_magnitude = distance_moved * self.config.odom_drift_rate_linear * 0.001
-            drift_angle = np.random.uniform(-np.pi/4, np.pi/4)  # Drift within ±45°
-            delta_x_local += drift_magnitude * np.cos(drift_angle)
-            delta_y_local += drift_magnitude * np.sin(drift_angle)
+            # Random noise - always apply when moving
+            if distance_moved > 0:
+                # Heading drift per meter of travel (rad/m)
+                # This simulates wheel size differences, uneven surfaces, etc.
+                heading_noise_per_meter = self.config.odom_drift_theta_random
+                delta_theta += np.random.normal(0, heading_noise_per_meter * distance_moved)
         
-        # Angular drift: proportional to rotation
-        if abs(delta_theta) > 0:
-            # Systematic angular drift
-            drift_factor_angular = 1.0 + self.config.odom_drift_rate_angular * 0.01
-            delta_theta *= drift_factor_angular
-        
-        # Add white noise to deltas
-        delta_x_local += np.random.normal(0, self.config.odom_position_noise * 0.1)
-        delta_y_local += np.random.normal(0, self.config.odom_position_noise * 0.1)
-        delta_theta += np.random.normal(0, self.config.odom_angle_noise * 0.1)
+        # No additional white noise - only drift affects odometry
         
         # Update odometry state by transforming local delta to odometry frame
         # Note: Use the odometry's current heading, not ground truth
@@ -358,9 +369,19 @@ class OdometrySimulator:
             error_x = self.odom_x - true_x
             error_y = self.odom_y - true_y
             error_theta = self._normalize_angle(self.odom_theta - true_theta)
-            print(f"ODOM DEBUG: error_x={error_x:.3f}, error_y={error_y:.3f}, "
-                  f"error_theta={np.degrees(error_theta):.1f}°, "
-                  f"total_dist={self.total_distance:.1f}m")
+            error_dist = np.sqrt(error_x**2 + error_y**2)
+            
+            # Calculate drift rates
+            if self.total_distance > 0:
+                lateral_drift_rate = (error_y / self.total_distance) * 100  # % of distance
+                heading_drift_rate = error_theta / self.total_distance  # rad/m
+            else:
+                lateral_drift_rate = 0
+                heading_drift_rate = 0
+            
+            print(f"ODOM: err={error_dist:.3f}m (x={error_x:.3f}, y={error_y:.3f}), "
+                  f"θ_err={np.degrees(error_theta):.1f}°, dist={self.total_distance:.1f}m | "
+                  f"lateral_drift={lateral_drift_rate:.1f}%, heading_drift={heading_drift_rate:.4f}rad/m")
         
         # Create odometry message
         odom_msg = Odometry()
@@ -368,35 +389,37 @@ class OdometrySimulator:
         odom_msg.header.frame_id = "odom"
         odom_msg.child_frame_id = child_frame_id
         
-        # Set position with additional white noise
-        odom_msg.pose.pose.position.x = self.odom_x + np.random.normal(0, self.config.odom_position_noise)
-        odom_msg.pose.pose.position.y = self.odom_y + np.random.normal(0, self.config.odom_position_noise)
+        # Set position (no additional noise - drift only)
+        odom_msg.pose.pose.position.x = self.odom_x
+        odom_msg.pose.pose.position.y = self.odom_y
         odom_msg.pose.pose.position.z = 0.0
         
-        # Set orientation with noise
-        noisy_theta = self.odom_theta + np.random.normal(0, self.config.odom_angle_noise)
+        # Set orientation (no additional noise - drift only)
+        noisy_theta = self.odom_theta
         q = quaternion_from_euler(0, 0, noisy_theta)
         odom_msg.pose.pose.orientation.x = q[0]
         odom_msg.pose.pose.orientation.y = q[1]
         odom_msg.pose.pose.orientation.z = q[2]
         odom_msg.pose.pose.orientation.w = q[3]
         
-        # Set velocities with noise (in robot's local frame)
-        odom_msg.twist.twist.linear.x = true_vx + np.random.normal(0, 0.05)
-        odom_msg.twist.twist.linear.y = true_vy + np.random.normal(0, 0.05)
-        odom_msg.twist.twist.angular.z = true_vtheta + np.random.normal(0, 0.01)
+        # Set velocities (no noise - velocities come from position differentiation)
+        odom_msg.twist.twist.linear.x = true_vx
+        odom_msg.twist.twist.linear.y = true_vy
+        odom_msg.twist.twist.angular.z = true_vtheta
         
-        # Covariances
+        # Covariances (reflect drift uncertainty)
+        # Pose covariance grows with distance traveled
         pose_cov = np.zeros(36)
-        pose_cov[0] = self.config.odom_position_noise**2  # x
-        pose_cov[7] = self.config.odom_position_noise**2  # y
-        pose_cov[35] = self.config.odom_angle_noise**2    # theta
+        pose_cov[0] = max(0.001, self.total_distance * 0.001)**2  # x uncertainty
+        pose_cov[7] = max(0.001, self.total_distance * 0.001)**2  # y uncertainty  
+        pose_cov[35] = max(0.001, self.total_rotation * 0.001)**2  # theta uncertainty
         odom_msg.pose.covariance = pose_cov.tolist()
         
+        # Twist covariance (fixed small values)
         twist_cov = np.zeros(36)
-        twist_cov[0] = 0.01   # vx
-        twist_cov[7] = 0.01   # vy
-        twist_cov[35] = 0.01  # vtheta
+        twist_cov[0] = 0.001   # vx
+        twist_cov[7] = 0.001   # vy
+        twist_cov[35] = 0.001  # vtheta
         odom_msg.twist.covariance = twist_cov.tolist()
         
         return odom_msg
@@ -408,7 +431,7 @@ class SensorSimulator:
     def __init__(self, config: SensorNoiseConfig):
         self.config = config
         self.imu_sim = ImuSimulator(config)
-        self.gps_sim = GpsSimulator()
+        self.gps_sim = GpsSimulator(config)
         self.odom_sim = OdometrySimulator(config)
     
     def generate_all_sensors(self, vehicle_state: Dict, dt: float, 

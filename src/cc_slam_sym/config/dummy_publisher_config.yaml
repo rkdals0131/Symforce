@@ -11,6 +11,7 @@ dummy_publisher:
       cones: 20.0             # 콘 관측 데이터 퍼블리싱 주기 (초당 20회)
       imu: 100.0              # IMU 데이터 퍼블리싱 주기 (초당 100회)
       gps: 8.0                # GPS 위치 데이터 퍼블리싱 주기 (초당 8회)
+      odometry: 100.0         # 오도메트리 시뮬레이션 데이터 퍼블리싱 주기 (초당 100회, if on)
       
     # 차량 시뮬레이션
     vehicle:
@@ -33,18 +34,31 @@ dummy_publisher:
       # 관측 노이즈 파라미터
       noise:
         position_stddev: 0.05 # 미터 - 콘 위치 측정 노이즈 표준편차
-        odom_position: 0.1    # 미터 - 오도메트리 위치 노이즈 표준편차
-        odom_angle: 0.05      # 라디안 - 오도메트리 각도 노이즈 표준편차 (약 2.9도)
         
         # 현실적인 센서 드리프트 및 바이어스 파라미터
         imu_accel_bias_drift: 0.1       # 미터/초² - 가속도계 바이어스 변화율 (시간에 따른 누적)
         imu_gyro_bias_drift: 0.01       # 라디안/초 - 자이로스코프 바이어스 변화율 (시간에 따른 누적)
         imu_accel_white_noise: 0.002    # 미터/초² - 가속도계 백색 잡음 (순간 노이즈)
         imu_gyro_white_noise: 0.0002    # 라디안/초 - 자이로스코프 백색 잡음 (순간 노이즈)
+
+        # GPS 노이즈 파라미터
+        gps_position_noise: 0.015     # m - GPS 위치 노이즈 (일반 GPS: 2-5m, RTK: 0.01-0.02m)
+        gps_altitude_noise: 0.1     # m - GPS 고도 노이즈 (일반적으로 수평보다 부정확)
         
-        # 오도메트리 누적 드리프트
-        odom_drift_rate_linear: 45.5     # 미터당 % - 선형 이동 시 누적 드리프트 비율
-        odom_drift_rate_angular: 25.2    # 라디안당 % - 회전 시 누적 드리프트 비율
+        # 오도메트리 드리프트 (축별 독립 제어)
+        # 휠 오도메트리는 주로 거리 기반 오차, IMU는 시간 기반 오차
+        odom_drift_x:
+          systematic: 0.0        # % - 전진 바이어스 (이동거리의 %)
+          random_stddev: 0.0     # m - 전진 랜덤 노이즈 (1회당)
+        odom_drift_y:
+          systematic: 0.0        # % - 측면 드리프트 (전진거리의 % - 휠 정렬 불량)
+          random_stddev: 0.000   # m - 측면 랜덤 노이즈 (1회당)
+        odom_drift_theta:
+          systematic: 0.0        # % - 회전 바이어스 (실제 회전량의 %)
+          random_stddev: 0.0   # rad/m - 방향 랜덤 노이즈 (1m 이동당)
+          # time_bias: 0.0       # rad/s - 시간 기반 바이어스 (정지시에도 적용) - 미구현
+        
+
         
       # 감지 오류 시뮬레이션 (LiDAR + 카메라 융합 문제)
       detection_errors:
