@@ -24,7 +24,7 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'dummy_publisher = cc_slam_sym.dummy_publisher_node:main',
+            'dummy_publisher = cc_slam_sym.simulation.dummy_publisher_node:main',
         ],
     },
 )

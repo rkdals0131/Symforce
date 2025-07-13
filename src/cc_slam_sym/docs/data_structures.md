@@ -15,7 +15,7 @@ struct ConeCluster {
     // 기본 속성
     double timestamp;              // ROS 타임스탬프
     Eigen::Vector3d position;      // 로봇 기준 3D 위치 (x, y, z)
-    std::string color;             // 콘 색상: "yellow", "blue", "red", "orange"
+    std::string color;             // 콘 색상: "yellow", "blue", "red"
     double confidence;             // 감지 신뢰도 [0.0, 1.0]
     
     // 추가 속성
@@ -62,7 +62,6 @@ enum class LandmarkType {
     CONE_YELLOW,
     CONE_BLUE,
     CONE_RED,
-    CONE_ORANGE,
     START_FINISH_LINE
 };
 ```

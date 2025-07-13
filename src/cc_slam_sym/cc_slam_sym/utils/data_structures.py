@@ -16,14 +16,12 @@ class ConeColor(Enum):
     YELLOW = "yellow"
     BLUE = "blue"
     RED = "red"
-    ORANGE = "orange"
     UNKNOWN = "unknown"
 
 class LandmarkType(Enum):
     CONE_YELLOW = "cone_yellow"
     CONE_BLUE = "cone_blue"
     CONE_RED = "cone_red"
-    CONE_ORANGE = "cone_orange"
     START_FINISH_LINE = "start_finish_line"
 
 @dataclass

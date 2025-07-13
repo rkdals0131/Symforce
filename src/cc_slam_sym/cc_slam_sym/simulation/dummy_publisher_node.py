@@ -40,6 +40,21 @@ class DummyPublisher(Node):
         self.declare_parameter('sensors.noise.odom_position', 0.1)  # Increased from 0.02 to 0.1 (10cm)
         self.declare_parameter('sensors.noise.odom_angle', 0.05)  # Increased from 0.01 to 0.05 (2.9 degrees)
         
+        # Drift and bias parameters
+        self.declare_parameter('sensors.noise.imu_accel_bias_drift', 0.02)
+        self.declare_parameter('sensors.noise.imu_gyro_bias_drift', 0.001)
+        self.declare_parameter('sensors.noise.imu_accel_white_noise', 0.01)
+        self.declare_parameter('sensors.noise.imu_gyro_white_noise', 0.0017)
+        self.declare_parameter('sensors.noise.odom_drift_rate_linear', 0.02)
+        self.declare_parameter('sensors.noise.odom_drift_rate_angular', 0.01)
+        
+        # Detection error parameters
+        self.declare_parameter('sensors.detection_errors.enable', True)
+        self.declare_parameter('sensors.detection_errors.false_negative_rate', 0.07)
+        self.declare_parameter('sensors.detection_errors.false_positive_rate', 0.002)
+        self.declare_parameter('sensors.detection_errors.wrong_color_rate', 0.002)
+        self.declare_parameter('sensors.detection_errors.unknown_color_rate', 0.08)
+        
         # Get parameters
         self.scenario = self.get_parameter('scenario.id').value
         self.publish_rate = self.get_parameter('publish_rates.cones').value
@@ -54,6 +69,21 @@ class DummyPublisher(Node):
         self.cone_position_noise = self.get_parameter('sensors.noise.position_stddev').value
         self.odom_position_noise = self.get_parameter('sensors.noise.odom_position').value
         self.odom_angle_noise = self.get_parameter('sensors.noise.odom_angle').value
+        
+        # Get drift and bias parameters
+        self.imu_accel_bias_drift = self.get_parameter('sensors.noise.imu_accel_bias_drift').value
+        self.imu_gyro_bias_drift = self.get_parameter('sensors.noise.imu_gyro_bias_drift').value
+        self.imu_accel_white_noise = self.get_parameter('sensors.noise.imu_accel_white_noise').value
+        self.imu_gyro_white_noise = self.get_parameter('sensors.noise.imu_gyro_white_noise').value
+        self.odom_drift_rate_linear = self.get_parameter('sensors.noise.odom_drift_rate_linear').value
+        self.odom_drift_rate_angular = self.get_parameter('sensors.noise.odom_drift_rate_angular').value
+        
+        # Get detection error parameters
+        self.detection_errors_enabled = self.get_parameter('sensors.detection_errors.enable').value
+        self.false_negative_rate = self.get_parameter('sensors.detection_errors.false_negative_rate').value
+        self.false_positive_rate = self.get_parameter('sensors.detection_errors.false_positive_rate').value
+        self.wrong_color_rate = self.get_parameter('sensors.detection_errors.wrong_color_rate').value
+        self.unknown_color_rate = self.get_parameter('sensors.detection_errors.unknown_color_rate').value
         
         # Load ground truth cones
         if self.scenario == 1:
@@ -114,6 +144,21 @@ class DummyPublisher(Node):
         self.robot_vy = 0.0
         self.robot_vtheta = 0.0
         
+        # IMU bias state (accumulates over time)
+        self.imu_accel_bias_x = 0.0
+        self.imu_accel_bias_y = 0.0
+        self.imu_accel_bias_z = 0.0
+        self.imu_gyro_bias_x = 0.0
+        self.imu_gyro_bias_y = 0.0
+        self.imu_gyro_bias_z = 0.0
+        
+        # Odometry drift state (cumulative errors)
+        self.odom_drift_x = 0.0
+        self.odom_drift_y = 0.0
+        self.odom_drift_theta = 0.0
+        self.total_distance_traveled = 0.0
+        self.total_rotation_accumulated = 0.0
+        
         # Initialize positions
         if self.scenario == 1:
             # Start in the middle of the track
@@ -139,9 +184,6 @@ class DummyPublisher(Node):
         # Last detected cones for visualization
         self.last_detected_cones = []  # List of (track_id, local_pos, cone_type)
         
-        # IMU bias (for realistic simulation)
-        self.imu_accel_bias = np.random.normal(0, 0.01, 3)
-        self.imu_gyro_bias = np.random.normal(0, 0.001, 3)
         
         # GPS origin (for UTM conversion)
         self.gps_origin_lat = 37.541383
@@ -260,11 +302,37 @@ class DummyPublisher(Node):
             self.gt_vy = 0.0
             self.gt_vtheta = 0.0
         
-        # Update noisy robot state (odom_sim = ground_truth + noise)
-        # Position noise
-        self.robot_x = self.gt_x + np.random.normal(0, self.odom_position_noise)
-        self.robot_y = self.gt_y + np.random.normal(0, self.odom_position_noise)
-        self.robot_theta = self.gt_theta + np.random.normal(0, self.odom_angle_noise)
+        # Update bias states (slow drift over time)
+        self.imu_accel_bias_x += np.random.normal(0, self.imu_accel_bias_drift * dt)
+        self.imu_accel_bias_y += np.random.normal(0, self.imu_accel_bias_drift * dt)
+        self.imu_accel_bias_z += np.random.normal(0, self.imu_accel_bias_drift * dt)
+        self.imu_gyro_bias_x += np.random.normal(0, self.imu_gyro_bias_drift * dt)
+        self.imu_gyro_bias_y += np.random.normal(0, self.imu_gyro_bias_drift * dt)
+        self.imu_gyro_bias_z += np.random.normal(0, self.imu_gyro_bias_drift * dt)
+        
+        # Update cumulative drift based on distance traveled
+        distance_step = np.sqrt((self.gt_vx * dt)**2 + (self.gt_vy * dt)**2)
+        rotation_step = abs(self.gt_vtheta * dt)
+        self.total_distance_traveled += distance_step
+        self.total_rotation_accumulated += rotation_step
+        
+        # Accumulate drift errors
+        self.odom_drift_x += distance_step * self.odom_drift_rate_linear * np.random.normal(0, 0.5)
+        self.odom_drift_y += distance_step * self.odom_drift_rate_linear * np.random.normal(0, 0.5)
+        self.odom_drift_theta += rotation_step * self.odom_drift_rate_angular * np.random.normal(0, 0.5)
+        
+        # Update noisy robot state = ground_truth + white_noise + drift + bias
+        self.robot_x = (self.gt_x + 
+                       np.random.normal(0, self.odom_position_noise) +  # White noise
+                       self.odom_drift_x)  # Cumulative drift
+        
+        self.robot_y = (self.gt_y + 
+                       np.random.normal(0, self.odom_position_noise) + 
+                       self.odom_drift_y)
+        
+        self.robot_theta = (self.gt_theta + 
+                           np.random.normal(0, self.odom_angle_noise) + 
+                           self.odom_drift_theta)
         
         # Velocity noise
         self.robot_vx = self.gt_vx + np.random.normal(0, 0.05)
@@ -467,6 +535,10 @@ class DummyPublisher(Node):
             del self.cone_track_mapping[cone_id]
         
         for cone_id, local_pos_gt, cone_type in visible_cones:
+            # Apply false negative (miss detection)
+            if self.detection_errors_enabled and np.random.random() < self.false_negative_rate:
+                continue  # Skip this cone (missed detection)
+            
             # If cone is newly visible, assign new track ID
             if cone_id not in self.cone_track_mapping:
                 self.cone_track_mapping[cone_id] = self.next_track_id
@@ -484,23 +556,65 @@ class DummyPublisher(Node):
             tracked_cone.position.y = local_pos_gt[1] + noise[1]
             tracked_cone.position.z = -0.15 + noise[2]  # Cone height with noise
             
+            # Apply detection errors (simulating LiDAR + Camera fusion issues)
+            final_color = cone_type
+            if self.detection_errors_enabled:
+                # Check for unknown classification (fusion failure)
+                if np.random.random() < self.unknown_color_rate:
+                    final_color = 'unknown'
+                # Check for wrong color classification
+                elif np.random.random() < self.wrong_color_rate:
+                    colors = ['yellow', 'blue', 'red']
+                    colors.remove(cone_type)  # Remove correct color
+                    final_color = np.random.choice(colors)
+            
             # Set color with proper format (matching CALICO output)
-            if cone_type == 'yellow':
+            if final_color == 'yellow':
                 tracked_cone.color = "Yellow cone"
-            elif cone_type == 'blue':
+            elif final_color == 'blue':
                 tracked_cone.color = "Blue cone"
-            elif cone_type == 'red':
+            elif final_color == 'red':
                 tracked_cone.color = "Red cone"
-            elif cone_type == 'orange':
-                tracked_cone.color = "Orange cone"
             else:
                 tracked_cone.color = "Unknown"
             
             msg.cones.append(tracked_cone)
             
-            # Store for visualization
+            # Store for visualization with final color and noisy position
             noisy_pos = np.array([local_pos_gt[0] + noise[0], local_pos_gt[1] + noise[1]])
-            self.last_detected_cones.append((track_id, noisy_pos, cone_type))
+            self.last_detected_cones.append((track_id, noisy_pos, final_color))
+        
+        # Add false positives (fake cones)
+        if self.detection_errors_enabled and np.random.random() < self.false_positive_rate:
+            # Generate random position within ROI
+            angle = np.random.uniform(-self.fov_rad/2, self.fov_rad/2)
+            distance = np.random.uniform(1.0, self.detection_range * 0.8)
+            
+            fake_local_x = distance * np.cos(angle)
+            fake_local_y = distance * np.sin(angle)
+            
+            # Create fake tracked cone
+            fake_cone = TrackedCone()
+            fake_cone.track_id = self.next_track_id
+            self.next_track_id += 1
+            
+            fake_cone.position.x = fake_local_x
+            fake_cone.position.y = fake_local_y
+            fake_cone.position.z = -0.15
+            
+            # Random color for fake cone
+            fake_color = np.random.choice(['yellow', 'blue', 'red', 'unknown'])
+            if fake_color == 'yellow':
+                fake_cone.color = "Yellow cone"
+            elif fake_color == 'blue':
+                fake_cone.color = "Blue cone"
+            elif fake_color == 'red':
+                fake_cone.color = "Red cone"
+            else:
+                fake_cone.color = "Unknown"
+            
+            msg.cones.append(fake_cone)
+            self.last_detected_cones.append((fake_cone.track_id, np.array([fake_local_x, fake_local_y]), fake_color))
         
         self.cone_pub.publish(msg)
         
@@ -665,18 +779,22 @@ class DummyPublisher(Node):
         # (simplified - in reality would need proper kinematics)
         accel[0] += self.gt_vtheta * self.gt_vy  # Centripetal
         
-        # Add noise and bias
-        accel += self.imu_accel_bias
-        accel += np.random.normal(0, 0.01, 3)
+        # Add drift bias and white noise
+        accel[0] += self.imu_accel_bias_x
+        accel[1] += self.imu_accel_bias_y
+        accel[2] += self.imu_accel_bias_z
+        accel += np.random.normal(0, self.imu_accel_white_noise, 3)
         
         msg.linear_acceleration.x = accel[0]
         msg.linear_acceleration.y = accel[1]
         msg.linear_acceleration.z = accel[2]
         
-        # Angular velocity (from ground truth + noise)
+        # Angular velocity (from ground truth + bias + noise)
         gyro = np.array([0.0, 0.0, self.gt_vtheta])
-        gyro += self.imu_gyro_bias
-        gyro += np.random.normal(0, 0.001, 3)
+        gyro[0] += self.imu_gyro_bias_x
+        gyro[1] += self.imu_gyro_bias_y  
+        gyro[2] += self.imu_gyro_bias_z
+        gyro += np.random.normal(0, self.imu_gyro_white_noise, 3)
         
         msg.angular_velocity.x = gyro[0]
         msg.angular_velocity.y = gyro[1]
@@ -853,8 +971,8 @@ class DummyPublisher(Node):
                 marker.color.r, marker.color.g, marker.color.b = 0.0, 0.0, 1.0
             elif cone_type == 'red':
                 marker.color.r, marker.color.g, marker.color.b = 1.0, 0.0, 0.0
-            elif cone_type == 'orange':
-                marker.color.r, marker.color.g, marker.color.b = 1.0, 0.5, 0.0
+            else:  # unknown
+                marker.color.r, marker.color.g, marker.color.b = 0.0, 1.0, 0.0  # Green for unknown
             marker.color.a = 0.8
             
             # No lifetime - markers stay until explicitly deleted

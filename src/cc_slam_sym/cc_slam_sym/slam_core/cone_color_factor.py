@@ -24,7 +24,7 @@ class ConeColorFactor:
         robot_pose: sf.Pose2,
         landmark_pos: sf.V2,
         observation: sf.V2,
-        observed_color: sf.Scalar,  # 0: yellow, 1: blue, 2: red, 3: orange
+        observed_color: sf.Scalar,  # 0: yellow, 1: blue, 2: red
         landmark_color: sf.Scalar,
         color_weight: sf.Scalar,
         epsilon: sf.Scalar = sf.numeric_epsilon
@@ -117,8 +117,7 @@ class ConeColorFactor:
         color_map = {
             'yellow': 0.0,
             'blue': 1.0,
-            'red': 2.0,
-            'orange': 3.0
+            'red': 2.0
         }
         return color_map.get(color_str.lower(), -1.0)
     
