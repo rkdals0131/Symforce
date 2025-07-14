@@ -13,6 +13,15 @@ from geometry_msgs.msg import Point, Quaternion
 from std_msgs.msg import ColorRGBA
 import rclpy.duration
 
+# Matplotlib visualization support (optional)
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle, Wedge
+    import matplotlib.animation as animation
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
 
 class VisualizationHelper:
     """Helper class for creating ROS visualization markers"""
@@ -346,3 +355,266 @@ def publish_detected_cones(publisher, detected_cones: List[Tuple[int, np.ndarray
         marker_array.markers.append(text_marker)
     
     publisher.publish(marker_array)
+
+
+# Matplotlib-based visualization (optional, for debugging and analysis)
+if MATPLOTLIB_AVAILABLE:
+    class MatplotlibVisualizer:
+        """Real-time SLAM visualization using matplotlib"""
+        
+        def __init__(self, xlim=(-10, 30), ylim=(-15, 15), figure_size=(12, 8)):
+            """Initialize visualizer
+            
+            Args:
+                xlim: X-axis limits (min, max)
+                ylim: Y-axis limits (min, max)
+                figure_size: Figure size in inches
+            """
+            self.xlim = xlim
+            self.ylim = ylim
+            
+            # Create figure and axis
+            self.fig, self.ax = plt.subplots(figsize=figure_size)
+            self.ax.set_xlim(xlim)
+            self.ax.set_ylim(ylim)
+            self.ax.set_aspect('equal')
+            self.ax.grid(True, alpha=0.3)
+            self.ax.set_xlabel('X (m)')
+            self.ax.set_ylabel('Y (m)')
+            self.ax.set_title('CC-SLAM-SYM Visualization')
+            
+            # Plot elements
+            self.robot_marker = None
+            self.robot_fov = None
+            self.trajectory_line = None
+            self.keyframe_markers = None
+            self.landmark_markers = {}
+            self.observation_lines = []
+            
+            # Data storage
+            self.trajectory_x = []
+            self.trajectory_y = []
+            self.keyframe_x = []
+            self.keyframe_y = []
+            
+            # Colors for different cone types
+            self.cone_colors = {
+                "yellow": "gold",
+                "blue": "blue",
+                "red": "red",
+                "unknown": "gray"
+            }
+            
+            # Statistics text
+            self.stats_text = None
+            
+            # Interactive mode
+            plt.ion()
+            plt.show()
+            
+        def update(self, 
+                  robot_pose: Tuple[float, float, float],
+                  landmarks: Dict[int, object],
+                  observations: Optional[List[object]] = None,
+                  is_keyframe: bool = False,
+                  stats: Optional[Dict] = None):
+            """Update visualization with new SLAM data
+            
+            Args:
+                robot_pose: Current robot pose (x, y, theta)
+                landmarks: Dictionary of current landmarks
+                observations: Current cone observations (optional)
+                is_keyframe: Whether current pose is a keyframe
+                stats: Optional statistics to display
+            """
+            # Clear previous dynamic elements
+            if self.robot_marker:
+                self.robot_marker.remove()
+            if self.robot_fov:
+                self.robot_fov.remove()
+            for line in self.observation_lines:
+                line.remove()
+            self.observation_lines.clear()
+            
+            # Update trajectory
+            self.trajectory_x.append(robot_pose[0])
+            self.trajectory_y.append(robot_pose[1])
+            
+            # Update trajectory line
+            if self.trajectory_line:
+                self.trajectory_line.remove()
+            self.trajectory_line, = self.ax.plot(
+                self.trajectory_x, self.trajectory_y,
+                'g-', linewidth=2, alpha=0.7, label='Trajectory'
+            )
+            
+            # Update keyframes
+            if is_keyframe:
+                self.keyframe_x.append(robot_pose[0])
+                self.keyframe_y.append(robot_pose[1])
+                if self.keyframe_markers:
+                    self.keyframe_markers.remove()
+                self.keyframe_markers = self.ax.scatter(
+                    self.keyframe_x, self.keyframe_y,
+                    c='green', s=50, marker='s', alpha=0.7, label='Keyframes'
+                )
+            
+            # Draw robot
+            self._draw_robot(robot_pose)
+            
+            # Update landmarks
+            self._update_landmarks(landmarks)
+            
+            # Draw observations if provided
+            if observations:
+                self._draw_observations(robot_pose, observations)
+                
+            # Update statistics
+            if stats:
+                self._update_stats(stats)
+                
+            # Update display
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            
+        def _draw_robot(self, pose: Tuple[float, float, float]):
+            """Draw robot at current pose
+            
+            Args:
+                pose: Robot pose (x, y, theta)
+            """
+            x, y, theta = pose
+            
+            # Robot body (circle)
+            self.robot_marker = Circle(
+                (x, y), 0.3, color='red', fill=True, alpha=0.8
+            )
+            self.ax.add_patch(self.robot_marker)
+            
+            # Field of view (wedge)
+            fov_angle = 60  # degrees
+            fov_range = 5   # meters
+            self.robot_fov = Wedge(
+                (x, y), fov_range,
+                np.degrees(theta) - fov_angle/2,
+                np.degrees(theta) + fov_angle/2,
+                color='red', alpha=0.2
+            )
+            self.ax.add_patch(self.robot_fov)
+            
+            # Direction arrow
+            arrow_len = 0.5
+            dx = arrow_len * np.cos(theta)
+            dy = arrow_len * np.sin(theta)
+            self.ax.arrow(x, y, dx, dy, head_width=0.2, head_length=0.1,
+                         fc='red', ec='red')
+                         
+        def _update_landmarks(self, landmarks: Dict[int, object]):
+            """Update landmark visualization
+            
+            Args:
+                landmarks: Dictionary of landmarks
+            """
+            # Remove old landmarks not in current set
+            old_ids = set(self.landmark_markers.keys())
+            current_ids = set(landmarks.keys())
+            for old_id in old_ids - current_ids:
+                if old_id in self.landmark_markers:
+                    self.landmark_markers[old_id].remove()
+                    del self.landmark_markers[old_id]
+                    
+            # Update or create landmarks
+            for lm_id, landmark in landmarks.items():
+                # Access landmark properties
+                color = getattr(landmark, 'color', 'unknown')
+                color = self.cone_colors.get(color, "gray")
+                position = getattr(landmark, 'position', [0, 0])
+                
+                if lm_id in self.landmark_markers:
+                    # Update existing marker
+                    self.landmark_markers[lm_id].remove()
+                    
+                # Create new marker
+                marker = Circle(
+                    (position[0], position[1]),
+                    0.15, color=color, fill=True, alpha=0.8,
+                    edgecolor='black', linewidth=1
+                )
+                self.ax.add_patch(marker)
+                self.landmark_markers[lm_id] = marker
+                
+                # Add landmark ID text
+                self.ax.text(
+                    position[0] + 0.2,
+                    position[1] + 0.2,
+                    f"{lm_id}",
+                    fontsize=8, alpha=0.7
+                )
+                
+        def _draw_observations(self, 
+                             robot_pose: Tuple[float, float, float],
+                             observations: List[object]):
+            """Draw observation rays from robot to observed cones
+            
+            Args:
+                robot_pose: Current robot pose
+                observations: List of cone observations
+            """
+            robot_x, robot_y, _ = robot_pose
+            
+            for obs in observations:
+                # Get observation position
+                obs_pos = getattr(obs, 'position', [0, 0])
+                
+                # Transform observation to world frame
+                obs_world_x = robot_x + obs_pos[0] * np.cos(robot_pose[2]) - obs_pos[1] * np.sin(robot_pose[2])
+                obs_world_y = robot_y + obs_pos[0] * np.sin(robot_pose[2]) + obs_pos[1] * np.cos(robot_pose[2])
+                
+                # Draw observation line
+                line, = self.ax.plot(
+                    [robot_x, obs_world_x],
+                    [robot_y, obs_world_y],
+                    'b--', alpha=0.3, linewidth=1
+                )
+                self.observation_lines.append(line)
+                
+        def _update_stats(self, stats: Dict):
+            """Update statistics display
+            
+            Args:
+                stats: Statistics dictionary
+            """
+            if self.stats_text:
+                self.stats_text.remove()
+                
+            text = f"Frame: {stats.get('frame_id', 0)}\n"
+            text += f"Landmarks: {stats.get('num_landmarks', 0)}\n"
+            
+            if 'association' in stats:
+                assoc = stats['association']
+                text += f"Matched: {assoc.get('matched', 0)}\n"
+                text += f"New obs: {assoc.get('unmatched_obs', 0)}\n"
+                
+            if 'processing_time' in stats:
+                timing = stats['processing_time']
+                text += f"Time: {timing.get('total', 0)*1000:.1f}ms"
+                
+            self.stats_text = self.ax.text(
+                0.02, 0.98, text,
+                transform=self.ax.transAxes,
+                fontsize=10,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            )
+            
+        def save_figure(self, filename: str):
+            """Save current figure to file
+            
+            Args:
+                filename: Output filename
+            """
+            self.fig.savefig(filename, dpi=150, bbox_inches='tight')
+            
+        def close(self):
+            """Close the visualization window"""
+            plt.close(self.fig)

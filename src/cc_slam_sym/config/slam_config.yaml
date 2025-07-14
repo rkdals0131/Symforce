@@ -1,0 +1,81 @@
+/**:
+  ros__parameters:
+    # Topic Configuration
+    topics:
+      cone_detection: "/fused_sorted_cones_ukf_sim"            
+      odometry: "/odom_sim"                          
+      # odometry: "/odometry/filtered"              
+      imu: "/ouster/imu_sim"
+      gps: "/ublox_gps_node/fix_sim"
+    
+    # Frame IDs
+    frames:
+      map: "map"
+      odom: "odom"
+      base_link: "base_link"
+    
+    # Frontend Configuration
+    frontend:
+      # Keyframe Selection
+      keyframe_distance_threshold: 2.0    # meters
+      keyframe_rotation_threshold: 0.3    # radians (~17 degrees)
+      keyframe_time_threshold: 1.0        # seconds
+      
+      # Data Association
+      max_association_distance: 1.5       # meters
+      require_color_match: true           # Enforce cone color matching
+      min_observations_for_landmark: 2    # Observations before confirming landmark
+      max_landmark_init_distance: 20.0    # Maximum distance to initialize landmark
+      
+      # Noise Models
+      odometry_position_noise: 0.1        # meters
+      odometry_rotation_noise: 0.05       # radians
+      landmark_position_noise: 0.2        # meters
+    
+    # Backend Configuration
+    backend:
+      # Optimization Settings
+      optimization_interval: 5            # Optimize every N keyframes
+      max_iterations: 100                 # Maximum optimizer iterations
+      relinearize_threshold: 0.1          # ISAM2 relinearization threshold
+      relinearize_skip: 10                # ISAM2 relinearization skip
+      
+      # Noise Models
+      prior_position_noise: 0.1           # meters
+      prior_rotation_noise: 0.05          # radians
+      odometry_position_noise: 0.2        # meters
+      odometry_rotation_noise: 0.1        # radians
+      landmark_observation_noise: 0.3     # meters
+      
+      # Robust Kernels
+      use_robust_kernels: true
+      huber_parameter: 1.0                # Huber robust kernel parameter
+      
+      # Sliding Window
+      use_sliding_window: true
+      max_keyframes: 50                   # Maximum keyframes to keep
+      
+      # Loop Closure (future feature)
+      enable_loop_closure: false
+      loop_closure_distance: 1.0          # meters
+      loop_closure_rotation: 0.2          # radians
+    
+    # Visualization Configuration
+    visualization:
+      publish_rate: 10.0                  # Hz
+      publish_tf: true                    # Publish TF transforms
+      publish_path: true                  # Publish optimized path
+      publish_graph_markers: true         # Publish factor graph visualization
+      publish_covariances: false          # Publish uncertainty ellipses
+      
+    # Performance Settings
+    performance:
+      max_queue_size: 100                 # Maximum queue size for async processing
+      processing_thread_sleep: 0.001      # seconds (1ms)
+      
+    # Debug Settings
+    debug:
+      verbose: false                      # Enable verbose logging
+      save_graph: false                   # Save factor graph to file
+      graph_save_interval: 10             # Save every N optimizations
+      graph_save_path: "/tmp/slam_graph"

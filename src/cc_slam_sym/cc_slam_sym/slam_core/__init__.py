@@ -8,4 +8,38 @@ Contains the main SLAM algorithms:
 - Loop Closure: Place recognition and loop detection
 """
 
-from .cone_color_factor import ConeColorFactor
+# Import data association module
+try:
+    from .data_association import DataAssociation, AssociationConfig, AssociationResult
+except ImportError:
+    pass
+
+# Import frontend module
+try:
+    from .frontend import SlamFrontend, FrontendConfig
+except ImportError:
+    pass
+
+# Import backend module
+try:
+    from .backend import SlamBackend, BackendConfig
+except ImportError:
+    pass
+
+# Import SLAM system
+try:
+    from .slam_system import SlamSystem, SlamSystemConfig
+except ImportError:
+    pass
+
+# Import visualizer
+try:
+    from .slam_visualizer import SlamVisualizer, SlamAnimator
+except ImportError:
+    pass
+
+# Import cone color factor if available
+try:
+    from .cone_color_factor import ConeColorFactor
+except (ImportError, AttributeError):
+    pass

@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'dummy_publisher = cc_slam_sym.simulation.dummy_publisher_node:main',
+            'slam_node = cc_slam_sym.ros_bridge.slam_ros_node:main',
         ],
     },
 )

@@ -79,6 +79,23 @@ class Landmark:
         return gtsam.Point2(self.position[0], self.position[1])
 
 @dataclass
+class OdometryData:
+    """Odometry measurement data (wheel encoders, VIO, or fused odometry)"""
+    timestamp: float
+    position: np.ndarray  # [x, y] in meters
+    orientation: float    # theta in radians
+    
+    # Optional: incremental odometry
+    delta_pose: Optional[np.ndarray] = None  # [dx, dy, dtheta] since last measurement
+    
+    # Velocity
+    linear_velocity: np.ndarray = field(default_factory=lambda: np.zeros(2))  # [vx, vy] m/s
+    angular_velocity: float = 0.0  # rad/s
+    
+    # Covariance
+    covariance: np.ndarray = field(default_factory=lambda: np.eye(3) * 0.1)
+
+@dataclass
 class ImuData:
     """IMU measurement data"""
     timestamp: float
