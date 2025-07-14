@@ -10,6 +10,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
+from scipy.interpolate import splprep, splev
 
 
 class MotionScenario(Enum):
@@ -54,7 +55,7 @@ class TrajectoryGenerator:
     
     @staticmethod
     def generate_formula_student_centerline(num_points: int = 400) -> List[Tuple[float, float]]:
-        """Generate centerline for Formula Student elliptical track"""
+        """Generate centerline for Formula Student elliptical track using spline interpolation"""
         # Use proven waypoints from successful implementation
         base_waypoints = [
             (35.0, 12.5), (88.0, 12.5),
@@ -63,61 +64,122 @@ class TrajectoryGenerator:
             (95.0, 22.0), (80.0, 27.5),
             (75.0, 27.5), (70.0, 27.5), (65.0, 27.5), (60.0, 27.5), (55.0, 27.5),
             (50.0, 27.5), (45.0, 27.5), (40.0, 27.5), (35.0, 27.5), (30.0, 27.5),
-            (27.6, 26.6), (12.0, 21.5),
-            (12.00, 21.50), (6.72, 19.90), (3.22, 15.64), 
+            (27.6, 26.6),  # Removed duplicate (12.0, 21.5)
+            (6.72, 19.90), (3.22, 15.64), 
             (2.68, 10.15), (5.28, 5.28), (10.15, 2.68), (15.64, 3.22), (19.90, 6.72), (21.50, 12.00),
             (23.0, 12.5), (30.0, 12.5),
         ]
         
+        # Remove any duplicate waypoints
+        unique_waypoints = []
+        for wp in base_waypoints:
+            if not unique_waypoints or (wp != unique_waypoints[-1]):
+                unique_waypoints.append(wp)
+        
+        # Convert to numpy arrays for spline fitting
+        base_waypoints_array = np.array(unique_waypoints)
+        x = base_waypoints_array[:, 0]
+        y = base_waypoints_array[:, 1]
+        
+        # Create periodic spline (closed track)
+        # s: smoothing parameter (0 = interpolating spline)
+        # k: degree of spline (3 = cubic)
+        # per: periodic spline for closed track
+        # Simple approach: linear interpolation with corner smoothing
         points = []
-        # Interpolate between waypoints for smoother path
-        for i in range(len(base_waypoints)):
-            current = base_waypoints[i]
-            next_wp = base_waypoints[(i + 1) % len(base_waypoints)]
+        
+        # First pass: linear interpolation between waypoints
+        for i in range(len(unique_waypoints)):
+            current = unique_waypoints[i]
+            next_wp = unique_waypoints[(i + 1) % len(unique_waypoints)]
             
-            # Add current waypoint
-            points.append(current)
-            
-            # Interpolate between current and next
+            # Calculate segment length
             dx = next_wp[0] - current[0]
             dy = next_wp[1] - current[1]
             distance = np.sqrt(dx**2 + dy**2)
             
             # Add interpolated points every 0.5 meters
-            num_interp = int(distance / 0.5)
-            for j in range(1, num_interp):
+            num_interp = max(1, int(distance / 0.5))
+            for j in range(num_interp):
                 t = j / float(num_interp)
                 x = current[0] + t * dx
                 y = current[1] + t * dy
                 points.append((x, y))
         
-        return points
+        # Second pass: smooth sharp corners
+        # Smooth only at waypoint locations for controlled smoothing
+        corner_radius = 2.0  # meters - adjust this for more/less smoothing
+        smoothed_points = []
+        
+        for i in range(len(points)):
+            prev_idx = (i - 5) % len(points)
+            next_idx = (i + 5) % len(points)
+            
+            # Check if we're near a waypoint (sharp corner)
+            near_waypoint = False
+            for wp in unique_waypoints:
+                dist = np.sqrt((points[i][0] - wp[0])**2 + (points[i][1] - wp[1])**2)
+                if dist < corner_radius:
+                    near_waypoint = True
+                    break
+            
+            if near_waypoint and i > 5 and i < len(points) - 5:
+                # Apply smoothing using weighted average
+                prev_point = points[prev_idx]
+                curr_point = points[i]
+                next_point = points[next_idx]
+                
+                # Weighted average (current point has more weight)
+                weight_curr = 0.5
+                weight_neighbors = 0.25
+                
+                smooth_x = (weight_neighbors * prev_point[0] + 
+                           weight_curr * curr_point[0] + 
+                           weight_neighbors * next_point[0])
+                smooth_y = (weight_neighbors * prev_point[1] + 
+                           weight_curr * curr_point[1] + 
+                           weight_neighbors * next_point[1])
+                
+                smoothed_points.append((smooth_x, smooth_y))
+            else:
+                smoothed_points.append(points[i])
+        
+        # Ensure we have approximately the requested number of points
+        if len(smoothed_points) != num_points:
+            # Resample to get exact number of points
+            indices = np.linspace(0, len(smoothed_points)-1, num_points, dtype=int)
+            smoothed_points = [smoothed_points[i] for i in indices]
+        
+        return smoothed_points
     
     @staticmethod
     def smooth_centerline(points: List[Tuple[float, float]], 
                          smoothing_factor: float = 0.1) -> List[Tuple[float, float]]:
-        """Apply smoothing to centerline points"""
-        if len(points) < 3:
+        """Apply smoothing to centerline points using spline interpolation"""
+        if len(points) < 4:  # Need at least 4 points for cubic spline
             return points
         
-        smoothed = []
-        for i in range(len(points)):
-            if i == 0 or i == len(points) - 1:
-                smoothed.append(points[i])
-            else:
-                # Simple moving average
-                prev_point = points[i-1]
-                curr_point = points[i]
-                next_point = points[(i+1) % len(points)]
-                
-                avg_x = (prev_point[0] + curr_point[0] + next_point[0]) / 3
-                avg_y = (prev_point[1] + curr_point[1] + next_point[1]) / 3
-                
-                # Blend with original
-                smooth_x = curr_point[0] * (1 - smoothing_factor) + avg_x * smoothing_factor
-                smooth_y = curr_point[1] * (1 - smoothing_factor) + avg_y * smoothing_factor
-                
-                smoothed.append((smooth_x, smooth_y))
+        # Convert to numpy arrays
+        points_array = np.array(points)
+        x = points_array[:, 0]
+        y = points_array[:, 1]
+        
+        # Check if the path is closed (first and last points are close)
+        is_closed = np.linalg.norm(points_array[0] - points_array[-1]) < 1.0
+        
+        if is_closed:
+            # Use periodic spline for closed tracks
+            tck, u = splprep([x, y], s=smoothing_factor * len(points), per=True)
+        else:
+            # Use regular spline for open tracks
+            tck, u = splprep([x, y], s=smoothing_factor * len(points), per=False)
+        
+        # Generate same number of points
+        u_new = np.linspace(0, 1, len(points))
+        x_smooth, y_smooth = splev(u_new, tck)
+        
+        # Convert back to list of tuples
+        smoothed = [(x_smooth[i], y_smooth[i]) for i in range(len(points))]
         
         return smoothed
 
@@ -142,8 +204,10 @@ class MotionController:
         else:
             self.centerline = TrajectoryGenerator.generate_formula_student_centerline()
         
-        # Smooth the centerline
-        self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline)
+        # For Formula Student track, the spline interpolation is already applied
+        # For straight track, apply smoothing if needed
+        if scenario == MotionScenario.STRAIGHT_TRACK:
+            self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline)
         
         # Initialize vehicle state based on scenario
         if scenario == MotionScenario.STRAIGHT_TRACK:

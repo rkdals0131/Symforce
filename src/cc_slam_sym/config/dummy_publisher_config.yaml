@@ -57,14 +57,14 @@ dummy_publisher:
         # 오도메트리 드리프트 (축별 독립 제어)
         # 휠 오도메트리는 주로 거리 기반 오차, IMU는 시간 기반 오차
         odom_drift_x:
-          systematic: 0.0        # % - 전진 바이어스 (이동거리의 %)
-          random_stddev: 0.0     # m - 전진 랜덤 노이즈 (1회당)
+          systematic: 5.0        # % - 전진 바이어스 (이동거리의 %)
+          random_stddev: 0.2     # m - 전진 랜덤 노이즈 (1회당)
         odom_drift_y:
           systematic: 0.0        # % - 측면 드리프트 (전진거리의 % - 휠 정렬 불량)
           random_stddev: 0.000   # m - 측면 랜덤 노이즈 (1회당)
         odom_drift_theta:
-          systematic: 0.0        # % - 회전 바이어스 (실제 회전량의 %)
-          random_stddev: 0.0   # rad/m - 방향 랜덤 노이즈 (1m 이동당; 휠 오도메트리)
+          systematic: 10.0        # % - 회전 바이어스 (실제 회전량의 %)
+          random_stddev: 0.2   # rad/m - 방향 랜덤 노이즈 (1m 이동당; 휠 오도메트리)
           # time_bias: 0.0       # rad/s - 시간 기반 바이어스 (정지시에도 적용; IMU 오도메트리) - 미구현
         
 
