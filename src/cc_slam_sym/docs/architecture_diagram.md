@@ -100,71 +100,62 @@ robot_localization 등에서 생성된 퓨전 오도메트리 사용
                     (이후 프론트엔드부터 동일)
 ```
 
-## 3. 핵심 모듈 상세 설계
+## 3. 핵심 모듈 상세 설계 (Python Pseudocode)
 
 ### 3.1 센서 퓨전 모듈 (옵션 A 전용)
-```cpp
-class SensorFusionModule {
-public:
-    // IMU 데이터 처리
-    void processIMU(const sensor_msgs::msg::Imu& imu_msg);
-    
-    // GPS 데이터 처리
-    void processGPS(const sensor_msgs::msg::NavSatFix& gps_fix,
-                    const geometry_msgs::msg::TwistWithCovarianceStamped& gps_vel);
-    
-    // 퓨전된 상태 반환
-    FusedState getFusedState();
-    
-private:
-    gtsam::PreintegratedImuMeasurements::Params imu_params_;
-    std::unique_ptr<gtsam::PreintegratedImuMeasurements> imu_preintegrator_;
-    UTMConverter utm_converter_;
-};
+```python
+class SensorFusionModule:
+    def __init__(self):
+        self.imu_params = gtsam.PreintegrationParams.MakeSharedU()
+        # ... 파라미터 설정 ...
+        self.imu_preintegrator = gtsam.PreintegratedImuMeasurements(self.imu_params)
+        self.utm_converter = UTMConverter()
+
+    def process_imu(self, imu_msg):
+        # ... IMU 데이터 처리 및 사전적분 ...
+
+    def process_gps(self, gps_fix, gps_vel):
+        # ... GPS 데이터 처리 ...
+
+    def get_fused_state(self):
+        # ... 퓨전된 상태 반환 ...
 ```
 
 ### 3.2 프론트엔드 모듈
-```cpp
-class FrontendModule {
-public:
-    // 키프레임 처리
-    void processKeyframe(const FusedState& state, 
-                        const std::vector<ConeCluster>& cones);
-    
-    // 데이터 연관
-    DataAssociationResult associateCones(
-        const std::vector<ConeCluster>& observed_cones,
-        const gtsam::Pose2& current_pose);
-    
-private:
-    // 키프레임 선정 기준
-    double keyframe_translation_threshold_ = 1.0;  // meters
-    double keyframe_rotation_threshold_ = 0.2;     // radians
-    
-    // 데이터 연관 파라미터
-    double association_distance_threshold_ = 2.0;  // meters
-    std::unique_ptr<KDTree> landmark_kdtree_;
-};
+```python
+class FrontendModule:
+    def __init__(self):
+        self.keyframe_translation_threshold = 1.0  # meters
+        self.keyframe_rotation_threshold = 0.2     # radians
+        self.association_distance_threshold = 2.0  # meters
+        # ... KD-Tree 초기화 ...
+
+    def process_keyframe(self, state, cones):
+        # ... 키프레임 처리 ...
+
+    def associate_cones(self, observed_cones, current_pose):
+        # ... 데이터 연관 수행 ...
 ```
 
 ### 3.3 백엔드 최적화 모듈
-```cpp
-class BackendOptimizer {
-public:
-    // 팩터 추가
-    void addIMUFactor(const gtsam::PreintegratedImuMeasurements& pim);
-    void addGPSFactor(const GPSMeasurement& gps);
-    void addLandmarkFactor(const LandmarkObservation& obs);
-    void addLoopClosureFactor(const LoopConstraint& loop);
-    
-    // 최적화 수행
-    OptimizationResult optimize();
-    
-private:
-    gtsam::ISAM2 isam2_;
-    gtsam::NonlinearFactorGraph graph_;
-    gtsam::Values values_;
-};
+```python
+class BackendOptimizer:
+    def __init__(self):
+        self.isam2 = gtsam.ISAM2(gtsam.ISAM2Params())
+        self.graph = gtsam.NonlinearFactorGraph()
+        self.values = gtsam.Values()
+
+    def add_imu_factor(self, pim):
+        # ... IMU 팩터 추가 ...
+
+    def add_gps_factor(self, gps):
+        # ... GPS 팩터 추가 ...
+
+    def add_landmark_factor(self, obs):
+        # ... 랜드마크 팩터 추가 ...
+
+    def optimize(self):
+        # ... ISAM2 최적화 수행 ...
 ```
 
 ## 4. 데이터 흐름

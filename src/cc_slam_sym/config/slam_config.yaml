@@ -24,6 +24,7 @@
       # Data Association
       max_association_distance: 1.5       # meters
       require_color_match: true           # Enforce cone color matching
+      use_mahalanobis: true              # Use Mahalanobis distance for robust association
       min_observations_for_landmark: 2    # Observations before confirming landmark
       max_landmark_init_distance: 20.0    # Maximum distance to initialize landmark
       

@@ -15,6 +15,7 @@ from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped, Point
 from visualization_msgs.msg import MarkerArray, Marker
 from std_msgs.msg import Header
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import tf2_ros
 from tf_transformations import quaternion_from_euler
 
@@ -64,9 +65,16 @@ class SlamNode(Node):
         # Start processing
         self.processing_thread.start()
         
+        # Set log level for debugging
+        self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
+        
         # Visualization timer
         viz_period = 1.0 / self.get_parameter('visualization.publish_rate').value
         self.viz_timer = self.create_timer(viz_period, self._visualization_callback)
+        
+        # Diagnostics publisher
+        self.diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
+        self.diag_timer = self.create_timer(1.0, self._publish_diagnostics)  # 1 Hz
         
         self.get_logger().info("CC-SLAM-SYM node initialized")
         
@@ -89,6 +97,7 @@ class SlamNode(Node):
         self.declare_parameter('frontend.keyframe_time_threshold', 1.0)
         self.declare_parameter('frontend.max_association_distance', 1.5)
         self.declare_parameter('frontend.require_color_match', True)
+        self.declare_parameter('frontend.use_mahalanobis', True)
         self.declare_parameter('frontend.min_observations_for_landmark', 2)
         self.declare_parameter('frontend.max_landmark_init_distance', 20.0)
         self.declare_parameter('frontend.odometry_position_noise', 0.1)
@@ -131,6 +140,7 @@ class SlamNode(Node):
             association_config=AssociationConfig(
                 max_distance_threshold=self.get_parameter('frontend.max_association_distance').value,
                 color_match_required=self.get_parameter('frontend.require_color_match').value,
+                use_mahalanobis=self.get_parameter('frontend.use_mahalanobis').value,
                 min_observations_for_landmark=self.get_parameter('frontend.min_observations_for_landmark').value
             ),
             min_observations_for_landmark=self.get_parameter('frontend.min_observations_for_landmark').value,
@@ -276,6 +286,11 @@ class SlamNode(Node):
                     observations, timestamp
                 )
                 
+                # Debug logging
+                self.get_logger().debug(f"Processed {len(observations)} observations, "
+                                       f"landmarks: {len(self.frontend.landmarks)}, "
+                                       f"candidates: {len(self.frontend.candidate_landmarks)}")
+                
                 # Check if new keyframe should be created
                 if self.frontend.should_create_keyframe(timestamp):
                     keyframe = self.frontend.create_keyframe(timestamp, observations)
@@ -307,9 +322,9 @@ class SlamNode(Node):
                         
                         # Add landmark observations
                         for obs in keyframe.observations:
-                            # Find corresponding landmark
+                            # Find corresponding landmark by track_id
                             for lm_id, landmark in self.frontend.landmarks.items():
-                                if obs.track_id == lm_id:
+                                if landmark.track_id == obs.track_id:
                                     # Update backend's landmark list
                                     self.backend.landmarks[lm_id] = landmark
                                     
@@ -586,9 +601,9 @@ class SlamNode(Node):
                 
                 # For each observed landmark
                 for obs in kf.observations:
-                    # Find corresponding landmark
+                    # Find corresponding landmark by track_id
                     for lm_id, landmark in self.backend.landmarks.items():
-                        if obs.track_id == lm_id:
+                        if landmark.track_id == obs.track_id:
                             lm_pos = None
                             
                             # Try to get optimized landmark position
@@ -643,6 +658,45 @@ class SlamNode(Node):
                                 break
         
         self.graph_pub.publish(marker_array)
+        
+    def _publish_diagnostics(self):
+        """Publish diagnostic information"""
+        diag_array = DiagnosticArray()
+        diag_array.header.stamp = self.get_clock().now().to_msg()
+        
+        # SLAM status
+        status = DiagnosticStatus()
+        status.name = "cc_slam_node"
+        status.level = DiagnosticStatus.OK
+        status.message = "SLAM running"
+        
+        # Add key-value pairs
+        status.values.append(KeyValue(key="keyframe_count", value=str(len(self.frontend.keyframes))))
+        status.values.append(KeyValue(key="landmark_count", value=str(len(self.frontend.landmarks))))
+        
+        # Backend statistics
+        if hasattr(self.backend, 'optimization_stats'):
+            status.values.append(KeyValue(
+                key="optimization_count", 
+                value=str(self.backend.optimization_stats.get('total_optimizations', 0))
+            ))
+            
+        # Queue sizes
+        cone_queue_size = len(self.cone_queue._data) if hasattr(self.cone_queue, '_data') else 0
+        odom_queue_size = len(self.odom_queue._data) if hasattr(self.odom_queue, '_data') else 0
+        total_queue_size = cone_queue_size + odom_queue_size
+        status.values.append(KeyValue(key="processing_queue_size", value=str(total_queue_size)))
+        
+        # Check for issues
+        if total_queue_size > 100:
+            status.level = DiagnosticStatus.WARN
+            status.message = "High queue size"
+        elif total_queue_size > 200:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "Queue overflow risk"
+            
+        diag_array.status.append(status)
+        self.diag_pub.publish(diag_array)
         
     def destroy_node(self):
         """Clean shutdown"""

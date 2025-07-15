@@ -56,9 +56,18 @@ class Landmark:
     first_seen_timestamp: float = 0.0
     last_seen_timestamp: float = 0.0
     confidence: float = 0.0
+    track_id: Optional[int] = None  # Original track ID from sensor
     
     # Uncertainty
     covariance: np.ndarray = field(default_factory=lambda: np.eye(2) * 0.1)
+    
+    # Color voting
+    color_votes: Dict[str, int] = field(default_factory=lambda: {
+        "yellow": 0,
+        "blue": 0,
+        "red": 0,
+        "unknown": 0
+    })
     
     def update_with_observation(self, obs: ConeCluster, current_time: float):
         """Update landmark statistics with new observation"""
@@ -69,6 +78,31 @@ class Landmark:
         
         # Update confidence (simple averaging)
         self.confidence = (self.confidence * (self.observation_count - 1) + obs.confidence) / self.observation_count
+        
+        # Update color votes
+        obs_color = obs.color.lower()
+        if obs_color in self.color_votes:
+            self.color_votes[obs_color] += 1
+            
+            # Update landmark color based on majority vote
+            # Exclude 'unknown' from voting unless it's the only option
+            valid_colors = {k: v for k, v in self.color_votes.items() if k != "unknown" and v > 0}
+            
+            if valid_colors:
+                # Use the color with most votes (excluding unknown)
+                majority_color = max(valid_colors, key=valid_colors.get)
+                self.color = majority_color
+                
+                # Update type based on new color
+                if majority_color == "yellow":
+                    self.type = LandmarkType.CONE_YELLOW
+                elif majority_color == "blue":
+                    self.type = LandmarkType.CONE_BLUE
+                elif majority_color == "red":
+                    self.type = LandmarkType.CONE_RED
+            elif self.color_votes["unknown"] > 0:
+                # Only use unknown if no other color has been observed
+                self.color = "unknown"
     
     def should_remove(self, current_time: float, timeout: float = 30.0) -> bool:
         """Check if landmark should be removed (not seen for too long)"""
@@ -77,6 +111,31 @@ class Landmark:
     def to_gtsam(self) -> gtsam.Point2:
         """Convert to GTSAM Point2"""
         return gtsam.Point2(self.position[0], self.position[1])
+        
+    def get_color_confidence(self) -> float:
+        """Get confidence in the current color classification
+        
+        Returns:
+            Ratio of votes for the current color vs total votes
+        """
+        total_votes = sum(self.color_votes.values())
+        if total_votes == 0:
+            return 0.0
+            
+        current_color_votes = self.color_votes.get(self.color, 0)
+        return current_color_votes / total_votes
+        
+    def get_color_distribution(self) -> Dict[str, float]:
+        """Get normalized distribution of color observations
+        
+        Returns:
+            Dictionary mapping colors to their observation ratios
+        """
+        total_votes = sum(self.color_votes.values())
+        if total_votes == 0:
+            return {k: 0.0 for k in self.color_votes}
+            
+        return {k: v / total_votes for k, v in self.color_votes.items()}
 
 @dataclass
 class OdometryData:

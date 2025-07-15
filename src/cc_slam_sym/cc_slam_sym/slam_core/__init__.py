@@ -41,5 +41,18 @@ except ImportError:
 # Import cone color factor if available
 try:
     from .cone_color_factor import ConeColorFactor
-except (ImportError, AttributeError):
+except (ImportError, AttributeError) as e:
+    # SymForce may not be available or configured
+    pass
+
+# Import custom factors
+try:
+    from .custom_factors import ConeObservationFactor
+except ImportError:
+    pass
+
+# Import local map
+try:
+    from .local_map import LocalMap, LocalMapConfig
+except ImportError:
     pass

@@ -15,6 +15,7 @@ from ..utils.data_structures import (
     ConeColor, LandmarkType
 )
 from .data_association import DataAssociation, AssociationConfig, AssociationResult
+from .local_map import LocalMap, LocalMapConfig
 
 
 @dataclass
@@ -55,6 +56,10 @@ class SlamFrontend:
         self.last_keyframe_pose = gtsam.Pose2(0.0, 0.0, 0.0)
         self.last_keyframe_time = 0.0
         
+        # Odometry prediction for data association
+        self.last_odom_pose = gtsam.Pose2(0.0, 0.0, 0.0)
+        self.predicted_pose = gtsam.Pose2(0.0, 0.0, 0.0)
+        
         # Verify pose initialization
         assert self.current_pose is not None, "Current pose not initialized"
         
@@ -67,6 +72,15 @@ class SlamFrontend:
         # Candidate landmarks (not yet confirmed)
         self.candidate_landmarks: Dict[int, List[ConeCluster]] = {}
         
+        # Local map for efficient data association
+        local_map_config = LocalMapConfig(
+            max_keyframes=20,
+            max_landmarks=100,
+            temporal_window=10.0,
+            spatial_radius=20.0
+        )
+        self.local_map = LocalMap(local_map_config)
+        
     def process_odometry(self, odom_data: OdometryData) -> gtsam.Pose2:
         """Process odometry data and update current pose estimate
         
@@ -76,6 +90,9 @@ class SlamFrontend:
         Returns:
             Updated pose estimate
         """
+        # Store previous pose for motion prediction
+        self.last_odom_pose = self.current_pose
+        
         # Convert odometry to relative motion
         if odom_data.delta_pose is not None:
             # Incremental odometry
@@ -85,6 +102,9 @@ class SlamFrontend:
                 odom_data.delta_pose[2]
             )
             self.current_pose = self.current_pose.compose(delta_pose)
+            
+            # Predict next pose for data association
+            self.predicted_pose = self.current_pose.compose(delta_pose)
         else:
             # Absolute odometry
             self.current_pose = gtsam.Pose2(
@@ -92,6 +112,16 @@ class SlamFrontend:
                 odom_data.position[1],
                 odom_data.orientation
             )
+            
+            # Calculate motion for prediction
+            if self.last_odom_pose:
+                motion = self.last_odom_pose.between(self.current_pose)
+                self.predicted_pose = self.current_pose.compose(motion)
+            else:
+                self.predicted_pose = self.current_pose
+        
+        # Update local map with current pose
+        self.local_map.update_current_pose(self.current_pose, odom_data.timestamp)
             
         return self.current_pose
         
@@ -157,6 +187,9 @@ class SlamFrontend:
         self.last_keyframe_pose = self.current_pose
         self.last_keyframe_time = timestamp
         
+        # Add to local map
+        self.local_map.add_keyframe(keyframe)
+        
         return keyframe
         
     def process_cone_observations(self,
@@ -165,32 +198,53 @@ class SlamFrontend:
         """Process cone observations and update landmarks
         
         Args:
-            observations: List of cone observations
+            observations: List of cone observations (in robot frame)
             timestamp: Current timestamp
             
         Returns:
             Data association result
         """
-        # Transform observations to world frame
-        world_observations = self._transform_to_world(observations)
+        # Use local map for efficient data association
+        local_landmarks = self.local_map.get_nearby_landmarks()
         
-        # Perform data association
-        landmark_list = list(self.landmarks.values())
+        # Perform data association with observations in robot frame
         association_result = self.data_association.associate(
-            world_observations,
-            landmark_list,
-            np.array([self.current_pose.x(), self.current_pose.y(), self.current_pose.theta()])
+            observations,  # Pass observations in robot frame
+            local_landmarks,
+            self.current_pose,  # Current pose
+            self.predicted_pose  # Predicted pose for better matching
         )
         
         # Update existing landmarks with matched observations
         for obs_idx, lm_idx in association_result.matched_pairs:
-            landmark = landmark_list[lm_idx]
-            observation = world_observations[obs_idx]
-            landmark.update_with_observation(observation, timestamp)
+            landmark = local_landmarks[lm_idx]
+            observation = observations[obs_idx]
+            # Transform observation to world frame for landmark update
+            obs_world_pos = self.current_pose.transformFrom(observation.position[:2])
+            world_obs = ConeCluster(
+                timestamp=observation.timestamp,
+                position=np.array([obs_world_pos[0], obs_world_pos[1], observation.position[2]]),
+                color=observation.color,
+                confidence=observation.confidence,
+                track_id=observation.track_id,
+                covariance=observation.covariance
+            )
+            landmark.update_with_observation(world_obs, timestamp)
             
         # Process unmatched observations (potential new landmarks)
         for obs_idx in association_result.unmatched_observations:
-            self._process_unmatched_observation(world_observations[obs_idx], timestamp)
+            observation = observations[obs_idx]
+            # Transform to world frame
+            obs_world_pos = self.current_pose.transformFrom(observation.position[:2])
+            world_obs = ConeCluster(
+                timestamp=observation.timestamp,
+                position=np.array([obs_world_pos[0], obs_world_pos[1], observation.position[2]]),
+                color=observation.color,
+                confidence=observation.confidence,
+                track_id=observation.track_id,
+                covariance=observation.covariance
+            )
+            self._process_unmatched_observation(world_obs, timestamp)
             
         return association_result
         
@@ -230,8 +284,9 @@ class SlamFrontend:
             observation: Unmatched cone observation (in world frame)
             timestamp: Current timestamp
         """
-        # Check if observation is within reasonable distance
-        distance = np.sqrt(observation.position[0]**2 + observation.position[1]**2)
+        # Check if observation is within reasonable distance from current robot position
+        robot_to_obs = observation.position[:2] - np.array([self.current_pose.x(), self.current_pose.y()])
+        distance = np.linalg.norm(robot_to_obs)
         if distance > self.config.max_landmark_init_distance:
             return
             
@@ -280,15 +335,24 @@ class SlamFrontend:
             observation_count=len(candidates),
             first_seen_timestamp=candidates[0].timestamp,
             last_seen_timestamp=timestamp,
-            confidence=np.mean([c.confidence for c in candidates])
+            confidence=np.mean([c.confidence for c in candidates]),
+            track_id=track_id  # Store the original track ID
         )
         
         # Add to landmarks
         self.landmarks[self.next_landmark_id] = landmark
         self.next_landmark_id += 1
         
+        # Add to local map
+        self.local_map.add_landmark(landmark)
+        
         # Clear candidates
         del self.candidate_landmarks[track_id]
+        
+        # Debug logging (if logger available)
+        import logging
+        logger = logging.getLogger("frontend")
+        logger.info(f"Created landmark {landmark.id} with track_id={track_id} at position ({avg_position[0]:.2f}, {avg_position[1]:.2f}), color={color}")
         
     def get_odometry_noise_model(self) -> gtsam.noiseModel.Diagonal:
         """Get noise model for odometry factors

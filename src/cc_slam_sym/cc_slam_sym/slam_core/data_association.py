@@ -26,7 +26,7 @@ class AssociationConfig:
     """Configuration for data association"""
     max_distance_threshold: float = 2.0   # Maximum distance for association (meters)
     color_match_required: bool = True     # Require color match for association
-    use_mahalanobis: bool = False        # Use Mahalanobis distance (future)
+    use_mahalanobis: bool = True         # Use Mahalanobis distance
     min_observations_for_landmark: int = 2  # Min observations before creating landmark
     
 
@@ -45,13 +45,14 @@ class DataAssociation:
     def associate(self, 
                   observations: List[ConeCluster], 
                   landmarks: List[Landmark],
-                  robot_pose: Optional[np.ndarray] = None) -> AssociationResult:
-        """Associate cone observations with existing landmarks
+                  robot_pose: Optional[gtsam.Pose2] = None,
+                  predicted_pose: Optional[gtsam.Pose2] = None) -> AssociationResult:
+        """Associate cone observations with existing landmarks using Mahalanobis distance
         
         Args:
-            observations: List of current cone observations
+            observations: List of current cone observations (in robot frame)
             landmarks: List of existing landmarks in the map
-            robot_pose: Current robot pose [x, y, theta] (optional, for future use)
+            robot_pose: Current robot pose (SE2)
             
         Returns:
             AssociationResult containing matched pairs and unmatched items
@@ -72,52 +73,123 @@ class DataAssociation:
                 unmatched_landmarks=[]
             )
             
-        # Extract positions from observations and landmarks
-        obs_positions = np.array([[obs.position[0], obs.position[1]] 
-                                  for obs in observations])
-        lm_positions = np.array([[lm.position[0], lm.position[1]] 
-                                 for lm in landmarks])
-        
-        # Build KD-tree for efficient nearest neighbor search
-        kdtree = KDTree(lm_positions)
-        
-        # Find nearest landmarks for each observation
-        distances, nearest_indices = kdtree.query(
-            obs_positions, 
-            k=1,  # Find single nearest neighbor
-            distance_upper_bound=self.config.max_distance_threshold
-        )
+        # Chi-squared threshold for 2-DOF at 95% confidence
+        from scipy.stats import chi2
+        chi2_threshold = chi2.ppf(0.95, df=2)  # ~5.991
         
         # Track which landmarks have been matched
         matched_landmark_set = set()
         matched_pairs = []
         unmatched_observations = []
         
-        # Process each observation
-        for obs_idx, (dist, lm_idx) in enumerate(zip(distances, nearest_indices)):
-            # Check if within distance threshold
-            if dist < self.config.max_distance_threshold:
-                # Check color match if required
-                if self.config.color_match_required:
-                    obs_color = observations[obs_idx].color
-                    lm_color = landmarks[lm_idx].color
+        # If we have mahalanobis distance enabled
+        if self.config.use_mahalanobis and robot_pose is not None:
+            # Extract positions for KD-tree (for efficient candidate search)
+            lm_positions = np.array([[lm.position[0], lm.position[1]] 
+                                     for lm in landmarks])
+            kdtree = KDTree(lm_positions)
+            
+            # Process each observation
+            for obs_idx, observation in enumerate(observations):
+                # Transform observation to world frame
+                obs_world = robot_pose.transformFrom(observation.position[:2])
+                
+                # Find candidate landmarks within a reasonable radius
+                candidate_indices = kdtree.query_ball_point(
+                    obs_world, 
+                    r=self.config.max_distance_threshold * 2  # Larger radius for candidates
+                )
+                
+                best_match = None
+                min_mahalanobis_dist_sq = float('inf')
+                
+                for lm_idx in candidate_indices:
+                    if lm_idx in matched_landmark_set:
+                        continue
+                        
+                    landmark = landmarks[lm_idx]
                     
-                    # Handle unknown colors - allow matching with any color
-                    if obs_color == "unknown" or lm_color == "unknown":
-                        color_matches = True
-                    else:
-                        color_matches = (obs_color == lm_color)
-                else:
-                    color_matches = True
+                    # Check color compatibility
+                    if self.config.color_match_required:
+                        if (observation.color != "unknown" and 
+                            landmark.color != "unknown" and 
+                            observation.color != landmark.color):
+                            continue
                     
-                # Add match if color matches and landmark not already matched
-                if color_matches and lm_idx not in matched_landmark_set:
-                    matched_pairs.append((obs_idx, lm_idx))
-                    matched_landmark_set.add(lm_idx)
+                    # Calculate innovation (observation - prediction)
+                    innovation = obs_world - landmark.position
+                    
+                    # Combine covariances: observation + landmark
+                    # Transform observation covariance to world frame
+                    R = robot_pose.rotation().matrix()  # 2x2 rotation matrix
+                    obs_cov_world = R @ observation.covariance[:2, :2] @ R.T
+                    
+                    # Innovation covariance
+                    S = landmark.covariance + obs_cov_world
+                    
+                    # Mahalanobis distance squared
+                    try:
+                        S_inv = np.linalg.inv(S)
+                        mahalanobis_dist_sq = innovation.T @ S_inv @ innovation
+                    except np.linalg.LinAlgError:
+                        # Singular matrix, skip this association
+                        continue
+                    
+                    # Check if within statistical threshold and better than current best
+                    if (mahalanobis_dist_sq < chi2_threshold and 
+                        mahalanobis_dist_sq < min_mahalanobis_dist_sq):
+                        min_mahalanobis_dist_sq = mahalanobis_dist_sq
+                        best_match = lm_idx
+                
+                if best_match is not None:
+                    matched_pairs.append((obs_idx, best_match))
+                    matched_landmark_set.add(best_match)
                 else:
                     unmatched_observations.append(obs_idx)
-            else:
-                unmatched_observations.append(obs_idx)
+                    
+        else:
+            # Fall back to simple Euclidean distance matching
+            # Extract positions from observations and landmarks
+            obs_positions = np.array([[obs.position[0], obs.position[1]] 
+                                      for obs in observations])
+            lm_positions = np.array([[lm.position[0], lm.position[1]] 
+                                     for lm in landmarks])
+            
+            # Build KD-tree for efficient nearest neighbor search
+            kdtree = KDTree(lm_positions)
+            
+            # Find nearest landmarks for each observation
+            distances, nearest_indices = kdtree.query(
+                obs_positions, 
+                k=1,  # Find single nearest neighbor
+                distance_upper_bound=self.config.max_distance_threshold
+            )
+            
+            # Process each observation
+            for obs_idx, (dist, lm_idx) in enumerate(zip(distances, nearest_indices)):
+                # Check if within distance threshold
+                if dist < self.config.max_distance_threshold:
+                    # Check color match if required
+                    if self.config.color_match_required:
+                        obs_color = observations[obs_idx].color
+                        lm_color = landmarks[lm_idx].color
+                        
+                        # Handle unknown colors - allow matching with any color
+                        if obs_color == "unknown" or lm_color == "unknown":
+                            color_matches = True
+                        else:
+                            color_matches = (obs_color == lm_color)
+                    else:
+                        color_matches = True
+                        
+                    # Add match if color matches and landmark not already matched
+                    if color_matches and lm_idx not in matched_landmark_set:
+                        matched_pairs.append((obs_idx, lm_idx))
+                        matched_landmark_set.add(lm_idx)
+                    else:
+                        unmatched_observations.append(obs_idx)
+                else:
+                    unmatched_observations.append(obs_idx)
                 
         # Find unmatched landmarks
         unmatched_landmarks = [i for i in range(len(landmarks)) 

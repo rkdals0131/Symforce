@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'dummy_publisher = cc_slam_sym.simulation.dummy_publisher_node:main',
             'slam_node = cc_slam_sym.ros_bridge.slam_ros_node:main',
+            'slam_debug_monitor = cc_slam_sym.utils.slam_debug_monitor:main',
         ],
     },
 )

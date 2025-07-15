@@ -98,8 +98,8 @@ class TrajectoryGenerator:
             dy = next_wp[1] - current[1]
             distance = np.sqrt(dx**2 + dy**2)
             
-            # Add interpolated points every 0.5 meters
-            num_interp = max(1, int(distance / 0.5))
+            # Add interpolated points every 0.3 meters for higher resolution
+            num_interp = max(1, int(distance / 0.3))
             for j in range(num_interp):
                 t = j / float(num_interp)
                 x = current[0] + t * dx
@@ -108,12 +108,12 @@ class TrajectoryGenerator:
         
         # Second pass: smooth sharp corners
         # Smooth only at waypoint locations for controlled smoothing
-        corner_radius = 2.0  # meters - adjust this for more/less smoothing
+        corner_radius = 3.0  # meters - increased for smoother curves
         smoothed_points = []
         
         for i in range(len(points)):
-            prev_idx = (i - 5) % len(points)
-            next_idx = (i + 5) % len(points)
+            prev_idx = (i - 10) % len(points)  # Increased window for smoother transitions
+            next_idx = (i + 10) % len(points)
             
             # Check if we're near a waypoint (sharp corner)
             near_waypoint = False
@@ -123,15 +123,15 @@ class TrajectoryGenerator:
                     near_waypoint = True
                     break
             
-            if near_waypoint and i > 5 and i < len(points) - 5:
+            if near_waypoint and i > 10 and i < len(points) - 10:
                 # Apply smoothing using weighted average
                 prev_point = points[prev_idx]
                 curr_point = points[i]
                 next_point = points[next_idx]
                 
-                # Weighted average (current point has more weight)
-                weight_curr = 0.5
-                weight_neighbors = 0.25
+                # Weighted average (reduced current point weight for smoother curves)
+                weight_curr = 0.4  # Reduced from 0.5
+                weight_neighbors = 0.3  # Increased from 0.25
                 
                 smooth_x = (weight_neighbors * prev_point[0] + 
                            weight_curr * curr_point[0] + 
@@ -198,16 +198,23 @@ class MotionController:
         self.scenario = scenario
         self.base_speed = base_speed
         
+        # Vehicle dynamics constraints
+        self.max_angular_velocity = 1.0  # rad/s - maximum yaw rate
+        self.max_angular_acceleration = 2.0  # rad/s^2 - maximum angular acceleration
+        
         # Generate centerline based on scenario
         if scenario == MotionScenario.STRAIGHT_TRACK:
             self.centerline = TrajectoryGenerator.generate_straight_track_centerline()
         else:
             self.centerline = TrajectoryGenerator.generate_formula_student_centerline()
         
-        # For Formula Student track, the spline interpolation is already applied
-        # For straight track, apply smoothing if needed
+        # Apply additional smoothing for both scenarios
+        # Use different smoothing factors based on scenario
         if scenario == MotionScenario.STRAIGHT_TRACK:
-            self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline)
+            self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline, smoothing_factor=0.05)
+        else:
+            # Apply light smoothing to already smoothed Formula Student track
+            self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline, smoothing_factor=0.02)
         
         # Initialize vehicle state based on scenario
         if scenario == MotionScenario.STRAIGHT_TRACK:
@@ -263,7 +270,20 @@ class MotionController:
                 return self.base_speed
         else:
             # Formula Student: Vary speed based on track curvature
-            # Slower in curves, faster on straights
+            # Calculate curvature from look-ahead point
+            look_ahead = self.get_look_ahead_point(5.0)  # 5 meters ahead
+            if look_ahead:
+                # Calculate curvature based on angle to look-ahead point
+                dx = look_ahead[0] - self.state.position[0]
+                dy = look_ahead[1] - self.state.position[1]
+                angle_to_target = np.arctan2(dy, dx)
+                angle_diff = abs(self._normalize_angle(angle_to_target - self.state.orientation[2]))
+                
+                # Reduce speed in curves (angle_diff > 0.3 rad ~ 17 degrees)
+                if angle_diff > 0.3:
+                    speed_factor = max(0.5, 1.0 - angle_diff / np.pi)
+                    return self.base_speed * speed_factor
+            
             return self.base_speed
     
     def update_motion(self, dt: float, elapsed_time: float) -> VehicleState:
@@ -319,9 +339,24 @@ class MotionController:
                 self.state.linear_velocity[0] = speed * np.cos(new_yaw)
                 self.state.linear_velocity[1] = speed * np.sin(new_yaw)
                 
-                # Calculate angular velocity (yaw rate)
+                # Calculate angular velocity (yaw rate) with limits
                 yaw_diff = self._normalize_angle(new_yaw - self.prev_yaw)
-                self.state.angular_velocity[2] = yaw_diff / dt if dt > 0 else 0.0
+                raw_angular_velocity = yaw_diff / dt if dt > 0 else 0.0
+                
+                # Apply angular velocity limit
+                if abs(raw_angular_velocity) > self.max_angular_velocity:
+                    raw_angular_velocity = np.sign(raw_angular_velocity) * self.max_angular_velocity
+                
+                # Apply angular acceleration limit
+                prev_angular_velocity = self.state.angular_velocity[2]
+                angular_acceleration = (raw_angular_velocity - prev_angular_velocity) / dt if dt > 0 else 0.0
+                
+                if abs(angular_acceleration) > self.max_angular_acceleration:
+                    # Limit acceleration
+                    angular_acceleration = np.sign(angular_acceleration) * self.max_angular_acceleration
+                    raw_angular_velocity = prev_angular_velocity + angular_acceleration * dt
+                
+                self.state.angular_velocity[2] = raw_angular_velocity
                 self.prev_yaw = new_yaw
                 
                 distance_to_move = 0

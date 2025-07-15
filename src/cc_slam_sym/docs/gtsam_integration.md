@@ -1,8 +1,8 @@
-# GTSAM 통합 상세 설계
+# GTSAM 통합 상세 설계 (Python 기반)
 
 ## 1. 개요
 
-본 문서는 CC-SLAM-SYM에서 GTSAM(Georgia Tech Smoothing and Mapping) 라이브러리를 활용한 Factor Graph 기반 최적화의 상세 설계를 다룹니다.
+본 문서는 CC-SLAM-SYM에서 GTSAM(Georgia Tech Smoothing and Mapping) 라이브러리의 Python 래퍼를 활용한 Factor Graph 기반 최적화의 상세 설계를 다룹니다.
 
 ## 2. Factor Graph 구조 설계
 
@@ -10,10 +10,10 @@
 
 ```
 Variables (노드):
-- X_i: 로봇 포즈 (SE(2)) at time i
-- L_j: 랜드마크 위치 (R²) for landmark j  
-- V_i: 로봇 속도 (R³) at time i (IMU 사용 시)
-- B_i: IMU 바이어스 at time i
+- X_i: 로봇 포즈 (gtsam.Pose2) at time i
+- L_j: 랜드마크 위치 (gtsam.Point2) for landmark j
+- V_i: 로봇 속도 (numpy.ndarray) at time i (IMU 사용 시)
+- B_i: IMU 바이어스 (gtsam.imuBias_ConstantBias) at time i
 
 Factors (엣지):
 - Prior factors: 초기 상태
@@ -26,456 +26,226 @@ Factors (엣지):
 
 ### 2.2 Variable 명명 규칙
 
-```cpp
-// Symbol 정의
-namespace sym {
-    // 포즈: X0, X1, X2, ...
-    gtsam::Symbol pose(int idx) { 
-        return gtsam::Symbol('x', idx); 
-    }
-    
-    // 랜드마크: L0, L1, L2, ...
-    gtsam::Symbol landmark(int idx) { 
-        return gtsam::Symbol('l', idx); 
-    }
-    
-    // 속도: V0, V1, V2, ...
-    gtsam::Symbol velocity(int idx) { 
-        return gtsam::Symbol('v', idx); 
-    }
-    
-    // IMU 바이어스: B0, B1, B2, ...
-    gtsam::Symbol bias(int idx) { 
-        return gtsam::Symbol('b', idx); 
-    }
-}
+```python
+import gtsam
+
+# 포즈: X0, X1, X2, ...
+def pose_key(idx):
+    return gtsam.symbol(ord('x'), idx)
+
+# 랜드마크: L0, L1, L2, ...
+def landmark_key(idx):
+    return gtsam.symbol(ord('l'), idx)
+
+# 속도: V0, V1, V2, ...
+def velocity_key(idx):
+    return gtsam.symbol(ord('v'), idx)
+
+# IMU 바이어스: B0, B1, B2, ...
+def bias_key(idx):
+    return gtsam.symbol(ord('b'), idx)
 ```
 
-## 3. Factor 구현 상세
+## 3. Factor 구현 상세 (Python 예시)
 
 ### 3.1 Prior Factor
 
 초기 포즈 또는 고정된 랜드마크에 대한 절대적 제약입니다.
 
-```cpp
-// 초기 포즈 Prior
-void addInitialPosePrior(gtsam::NonlinearFactorGraph& graph,
-                        const gtsam::Pose2& initial_pose,
-                        const Eigen::Vector3d& sigmas = {0.1, 0.1, 0.05}) {
-    auto prior_noise = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-    graph.add(gtsam::PriorFactor<gtsam::Pose2>(
-        sym::pose(0), initial_pose, prior_noise
-    ));
-}
+```python
+import numpy as np
 
-// 랜드마크 Prior (시작/종료 라인 등)
-void addLandmarkPrior(gtsam::NonlinearFactorGraph& graph,
-                     int landmark_id,
-                     const gtsam::Point2& position,
-                     double sigma = 0.05) {
-    auto prior_noise = gtsam::noiseModel::Isotropic::Sigma(2, sigma);
-    graph.add(gtsam::PriorFactor<gtsam::Point2>(
-        sym::landmark(landmark_id), position, prior_noise
-    ));
-}
+# 초기 포즈 Prior
+def add_initial_pose_prior(graph, initial_pose, sigmas=np.array([0.1, 0.1, 0.05])):
+    prior_noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+    graph.add(gtsam.PriorFactorPose2(pose_key(0), initial_pose, prior_noise))
+
+# 랜드마크 Prior (시작/종료 라인 등)
+def add_landmark_prior(graph, landmark_id, position, sigma=0.05):
+    prior_noise = gtsam.noiseModel.Isotropic.Sigma(2, sigma)
+    graph.add(gtsam.PriorFactorPoint2(landmark_key(landmark_id), position, prior_noise))
 ```
 
 ### 3.2 Odometry Factor
 
-연속된 포즈 간의 상대적 움직임 제약입니다.
+연속된 포즈 간의 상대적 움직임 제약입��다.
 
-```cpp
-class OdometryFactor {
-public:
-    static void add(gtsam::NonlinearFactorGraph& graph,
-                   int from_idx, int to_idx,
-                   const gtsam::Pose2& odometry,
-                   const OdometryNoise& noise_params) {
-        // 적응적 노이즈 모델 (이동 거리에 비례)
-        double distance = odometry.translation().norm();
-        double rotation = std::abs(odometry.theta());
-        
-        Eigen::Vector3d sigmas;
-        sigmas << noise_params.sigma_x * (1.0 + noise_params.scale_x * distance),
-                 noise_params.sigma_y * (1.0 + noise_params.scale_y * distance),
-                 noise_params.sigma_theta * (1.0 + noise_params.scale_theta * rotation);
-        
-        auto noise = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-        
-        graph.add(gtsam::BetweenFactor<gtsam::Pose2>(
-            sym::pose(from_idx), sym::pose(to_idx),
-            odometry, noise
-        ));
-    }
-};
+```python
+def add_odometry_factor(graph, from_idx, to_idx, odometry_pose, noise_params):
+    # 적응적 노이즈 모델 (이동 거리에 비례)
+    distance = odometry_pose.translation().norm()
+    rotation = abs(odometry_pose.rotation().theta())
 
-struct OdometryNoise {
-    double sigma_x = 0.1;       // 기본 x 노이즈
-    double sigma_y = 0.05;      // 기본 y 노이즈  
-    double sigma_theta = 0.05;  // 기본 회전 노이즈
-    double scale_x = 0.01;      // 거리 비례 계수
-    double scale_y = 0.005;
-    double scale_theta = 0.01;
-};
+    sigmas = np.array([
+        noise_params['sigma_x'] * (1.0 + noise_params['scale_x'] * distance),
+        noise_params['sigma_y'] * (1.0 + noise_params['scale_y'] * distance),
+        noise_params['sigma_theta'] * (1.0 + noise_params['scale_theta'] * rotation)
+    ])
+    
+    noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+    graph.add(gtsam.BetweenFactorPose2(
+        pose_key(from_idx), pose_key(to_idx), odometry_pose, noise
+    ))
 ```
 
 ### 3.3 Landmark Observation Factor
 
-로봇 포즈에서 랜드마크 관측에 대한 제약입니다.
+로봇 포즈에서 랜드마크 관측에 대한 제약입니다. `gtsam.CustomFactor`를 상속받아 Python으로 직접 커스텀 팩터를 정의할 수 있습니다.
 
-```cpp
-// 2D 랜드마크 관측 팩터
-class LandmarkObservationFactor : public gtsam::NoiseModelFactor2<gtsam::Pose2, gtsam::Point2> {
-private:
-    gtsam::Point2 measured_;  // 로봇 좌표계 관측값
-    
-public:
-    LandmarkObservationFactor(gtsam::Key pose_key, gtsam::Key landmark_key,
-                             const gtsam::Point2& measured,
-                             const gtsam::SharedNoiseModel& model)
-        : NoiseModelFactor2(model, pose_key, landmark_key), measured_(measured) {}
-    
-    gtsam::Vector evaluateError(const gtsam::Pose2& pose,
-                               const gtsam::Point2& landmark,
-                               boost::optional<gtsam::Matrix&> H1 = boost::none,
-                               boost::optional<gtsam::Matrix&> H2 = boost::none) const override {
-        // 예측된 관측값 계산
-        gtsam::Matrix2 H_transform;
-        gtsam::Point2 predicted = pose.transformTo(landmark, H_transform, H2);
+```python
+class ConeObservationFactor(gtsam.CustomFactor):
+    def __init__(self, pose_k, landmark_k, measured_point, model):
+        super().__init__(model, [pose_k, landmark_k], self.error_func)
+        self.measured = measured_point
+
+    def error_func(self, values, H_list=None):
+        pose = values.atPose2(self.keys()[0])
+        landmark = values.atPoint2(self.keys()[1])
         
-        if (H1) {
-            // 포즈에 대한 야코비안
-            *H1 = (gtsam::Matrix23() << H_transform, 
-                   -predicted.y(), predicted.x()).finished();
-        }
-        
-        // 잔차 계산
-        return predicted - measured_;
-    }
-    
-    // 거리 기반 적응적 노이즈
-    static gtsam::SharedNoiseModel createNoise(double distance, 
-                                              double base_sigma = 0.05) {
-        double sigma = base_sigma * (1.0 + 0.01 * distance);
-        return gtsam::noiseModel::Isotropic::Sigma(2, sigma);
-    }
-};
+        if H_list is not None:
+            H1 = np.zeros((2, 3))
+            H2 = np.zeros((2, 2))
+            predicted = pose.transformTo(landmark, H1, H2)
+            H_list[0] = H1
+            H_list[1] = H2
+        else:
+            predicted = pose.transformTo(landmark)
+
+        error = predicted - self.measured
+        return error
+```
+또는 간단하게 내장 팩터를 사용할 수 있습니다.
+```python
+def add_landmark_factor(graph, pose_idx, landmark_id, measured_br, noise_model):
+    # measured_br: gtsam.BearingRange2D
+    graph.add(gtsam.BearingRangeFactor2D(
+        pose_key(pose_idx), landmark_key(landmark_id),
+        measured_br.bearing(), measured_br.range(), noise_model
+    ))
 ```
 
 ### 3.4 IMU Factor
 
 IMU 사전적분을 사용한 연속 상태 간 제약입니다.
 
-```cpp
-class ImuIntegration {
-private:
-    std::shared_ptr<gtsam::PreintegratedImuMeasurements> preintegrated_;
-    gtsam::imuBias::ConstantBias current_bias_;
-    
-public:
-    ImuIntegration(const ImuParameters& params) {
-        auto p = gtsam::PreintegrationParams::MakeSharedU(params.gravity);
-        
-        // IMU 노이즈 설정
-        p->accelerometerCovariance = gtsam::I_3x3 * pow(params.accel_noise_density, 2);
-        p->gyroscopeCovariance = gtsam::I_3x3 * pow(params.gyro_noise_density, 2);
-        p->integrationCovariance = gtsam::I_3x3 * 1e-8;
-        
-        // 바이어스 모델
-        p->biasAccCovariance = gtsam::I_3x3 * pow(params.accel_bias_stability, 2);
-        p->biasOmegaCovariance = gtsam::I_3x3 * pow(params.gyro_bias_stability, 2);
-        
-        preintegrated_ = std::make_shared<gtsam::PreintegratedImuMeasurements>(p, current_bias_);
-    }
-    
-    void addMeasurement(const ImuData& imu, double dt) {
-        preintegrated_->integrateMeasurement(
-            imu.linear_acceleration,
-            imu.angular_velocity,
+```python
+class ImuIntegration:
+    def __init__(self, params):
+        self.preintegrated = gtsam.PreintegratedImuMeasurements(params)
+
+    def add_measurement(self, imu_data, dt):
+        self.preintegrated.integrateMeasurement(
+            imu_data.linear_acceleration,
+            imu_data.angular_velocity,
             dt
-        );
-    }
-    
-    void addToGraph(gtsam::NonlinearFactorGraph& graph,
-                   int from_idx, int to_idx) {
-        // 2D SLAM을 위한 IMU 팩터 (z축 회전만 사용)
-        graph.add(gtsam::ImuFactor(
-            sym::pose(from_idx), sym::velocity(from_idx),
-            sym::pose(to_idx), sym::velocity(to_idx),
-            sym::bias(from_idx),
-            *preintegrated_
-        ));
-        
-        // 바이어스 변화 제약
-        auto bias_noise = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3);
-        graph.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(
-            sym::bias(from_idx), sym::bias(to_idx),
-            gtsam::imuBias::ConstantBias(), bias_noise
-        ));
-    }
-};
+        )
+
+    def add_to_graph(self, graph, from_idx, to_idx):
+        graph.add(gtsam.ImuFactor(
+            pose_key(from_idx), velocity_key(from_idx),
+            pose_key(to_idx), velocity_key(to_idx),
+            bias_key(from_idx),
+            self.preintegrated
+        ))
+        # ... 바이어스 제약 추가 ...
 ```
 
 ### 3.5 GPS Factor
 
 RTK-GPS의 절대 위치 제약입니다.
 
-```cpp
-class GpsFactor : public gtsam::NoiseModelFactor1<gtsam::Pose2> {
-private:
-    gtsam::Point2 gps_position_;
-    
-public:
-    GpsFactor(gtsam::Key pose_key, 
-             const gtsam::Point2& gps_position,
-             const gtsam::SharedNoiseModel& model)
-        : NoiseModelFactor1(model, pose_key), gps_position_(gps_position) {}
-    
-    gtsam::Vector evaluateError(const gtsam::Pose2& pose,
-                               boost::optional<gtsam::Matrix&> H = boost::none) const override {
-        if (H) {
-            *H = (gtsam::Matrix23() << 1, 0, 0, 
-                                       0, 1, 0).finished();
-        }
-        return pose.translation() - gps_position_;
-    }
-    
-    // RTK 상태에 따른 노이즈 모델
-    static gtsam::SharedNoiseModel createNoise(const GpsData& gps) {
-        Eigen::Vector2d sigmas;
-        
-        switch (gps.fix_type) {
-            case GpsData::RTK_FIXED:
-                sigmas << 0.02, 0.02;  // 2cm
-                break;
-            case GpsData::RTK_FLOAT:
-                sigmas << 0.10, 0.10;  // 10cm
-                break;
-            default:
-                sigmas << 1.0, 1.0;    // 1m (사용 안함)
-        }
-        
-        return gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-    }
-};
+```python
+def add_gps_factor(graph, pose_idx, gps_position, noise_model):
+    # gtsam.GPSFactor는 3D용이므로, 2D SLAM에서는 PriorFactor를 활용
+    # gtsam.Pose2(x, y, theta)
+    gps_pose = gtsam.Pose2(gps_position[0], gps_position[1], 0) 
+    # GPS는 방향 정보가 없으므로, 위치에 대한 Prior로 추가하되, 방향에 대한 노이즈는 매우 크게 설정
+    gps_noise_sigmas = np.array([noise_model.sigmas()[0], noise_model.sigmas()[1], 1e9])
+    gps_noise = gtsam.noiseModel.Diagonal.Sigmas(gps_noise_sigmas)
+    graph.add(gtsam.PriorFactorPose2(pose_key(pose_idx), gps_pose, gps_noise))
 ```
 
 ## 4. ISAM2 증분 최적화
 
 ### 4.1 ISAM2 설정
 
-```cpp
-class SlamOptimizer {
-private:
-    gtsam::ISAM2 isam2_;
-    gtsam::Values current_estimate_;
-    
-public:
-    SlamOptimizer() {
-        gtsam::ISAM2Params params;
-        
-        // 재선형화 설정
-        params.relinearizeThreshold = 0.01;
-        params.relinearizeSkip = 10;
-        
-        // 최적화 설정
-        params.optimizationParams = gtsam::ISAM2DoglegParams();
-        params.enableDetailedResults = true;
-        
-        // 팩터 제거 허용 (루프 클로저 재검증용)
-        params.enablePartialRelinearizationCheck = true;
-        
-        isam2_ = gtsam::ISAM2(params);
-    }
-    
-    void update(const gtsam::NonlinearFactorGraph& new_factors,
-               const gtsam::Values& new_values,
-               const std::vector<size_t>& remove_indices = {}) {
-        // ISAM2 업데이트
-        gtsam::ISAM2Result result = isam2_.update(
-            new_factors, new_values,
-            gtsam::FactorIndices(remove_indices.begin(), remove_indices.end())
-        );
-        
-        // 통계 로깅
-        if (result.errorBefore && result.errorAfter) {
-            spdlog::debug("Optimization error: {:.6f} -> {:.6f}",
-                         *result.errorBefore, *result.errorAfter);
-        }
-        
-        // 현재 추정값 업데이트
-        current_estimate_ = isam2_.calculateEstimate();
-    }
-};
-```
+```python
+class SlamOptimizer:
+    def __init__(self):
+        params = gtsam.ISAM2Params()
+        params.setRelinearizeThreshold(0.01)
+        params.setRelinearizeSkip(10)
+        self.isam2 = gtsam.ISAM2(params)
+        self.current_estimate = gtsam.Values()
 
-### 4.2 키프레임 기반 업데이트 전략
-
-```cpp
-class KeyframeManager {
-private:
-    struct KeyframeData {
-        int id;
-        gtsam::Pose2 pose;
-        std::vector<int> observed_landmarks;
-        double timestamp;
-    };
-    
-    std::deque<KeyframeData> active_keyframes_;
-    const size_t max_active_keyframes_ = 20;
-    
-public:
-    bool shouldAddKeyframe(const gtsam::Pose2& current_pose,
-                          const gtsam::Pose2& last_keyframe_pose) {
-        double trans_dist = (current_pose.translation() - 
-                           last_keyframe_pose.translation()).norm();
-        double rot_dist = std::abs(current_pose.theta() - 
-                                  last_keyframe_pose.theta());
-        
-        return trans_dist > 1.0 || rot_dist > 0.2;  // 1m 또는 ~11도
-    }
-    
-    void addKeyframe(const KeyframeData& kf,
-                    gtsam::NonlinearFactorGraph& graph,
-                    gtsam::Values& values) {
-        active_keyframes_.push_back(kf);
-        
-        // 슬라이딩 윈도우 관리
-        if (active_keyframes_.size() > max_active_keyframes_) {
-            marginalizeOldest(graph, values);
-        }
-    }
-    
-private:
-    void marginalizeOldest(gtsam::NonlinearFactorGraph& graph,
-                          gtsam::Values& values) {
-        // 가장 오래된 키프레임을 마지널라이즈
-        // (구현 상세는 GTSAM marginalization 참고)
-    }
-};
+    def update(self, new_factors, new_values):
+        result = self.isam2.update(new_factors, new_values)
+        self.current_estimate = self.isam2.calculateEstimate()
 ```
 
 ## 5. 강건성을 위한 기법
 
 ### 5.1 Robust Kernel
 
-아웃라이어에 강건한 최적화를 위한 Huber/Cauchy 커널 사용:
-
-```cpp
-// Huber robust kernel
-auto huber = gtsam::noiseModel::Robust::Create(
-    gtsam::noiseModel::mEstimator::Huber::Create(1.345),
-    base_noise_model
-);
-
-// Cauchy robust kernel (더 강한 아웃라이어 제거)
-auto cauchy = gtsam::noiseModel::Robust::Create(
-    gtsam::noiseModel::mEstimator::Cauchy::Create(0.1),
-    base_noise_model
-);
-```
-
-### 5.2 Chi-square 테스트
-
-팩터의 유효성 검증:
-
-```cpp
-bool validateFactor(const gtsam::NonlinearFactor& factor,
-                   const gtsam::Values& values,
-                   double chi2_threshold = 5.991) {  // 95% for 2-DOF
-    double error = factor.error(values);
-    return error < chi2_threshold;
-}
+```python
+# Huber robust kernel
+base_noise = gtsam.noiseModel.Isotropic.Sigma(2, 1.0)
+huber_noise = gtsam.noiseModel.Robust.Create(
+    gtsam.noiseModel.mEstimator.Huber.Create(1.345),
+    base_noise
+)
 ```
 
 ## 6. 구현 예시
 
 ### 6.1 전체 파이프라인
 
-```cpp
-class GTSAMBackend {
-private:
-    SlamOptimizer optimizer_;
-    KeyframeManager keyframe_manager_;
-    gtsam::NonlinearFactorGraph new_factors_;
-    gtsam::Values new_values_;
-    
-public:
-    void processKeyframe(const Keyframe& kf,
-                        const std::vector<DataAssociation::Match>& matches) {
-        // 1. 오도메트리 팩터 추가
-        if (kf.id > 0) {
-            OdometryFactor::add(new_factors_, kf.id-1, kf.id,
-                              kf.relative_odometry, OdometryNoise());
-        }
+```python
+class GTSAMBackend:
+    def __init__(self):
+        self.optimizer = SlamOptimizer()
+        self.new_factors = gtsam.NonlinearFactorGraph()
+        self.new_values = gtsam.Values()
+
+    def process_keyframe(self, keyframe, matches):
+        # 1. 오도메트리 팩터 추가
+        # ...
         
-        // 2. 랜드마크 관측 팩터 추가
-        for (const auto& match : matches) {
-            double distance = kf.observations[match.observation_idx]
-                            .position.norm();
-            
-            auto noise = LandmarkObservationFactor::createNoise(distance);
-            new_factors_.add(LandmarkObservationFactor(
-                sym::pose(kf.id),
-                sym::landmark(match.landmark_id),
-                kf.observations[match.observation_idx].position,
-                noise
-            ));
-        }
-        
-        // 3. GPS 팩터 추가 (있을 경우)
-        if (kf.gps_data && kf.gps_data->isValid()) {
-            auto noise = GpsFactor::createNoise(*kf.gps_data);
-            new_factors_.add(GpsFactor(
-                sym::pose(kf.id),
-                kf.gps_data->toLocal(origin_lat_, origin_lon_),
-                noise
-            ));
-        }
-        
-        // 4. 초기값 설정
-        new_values_.insert(sym::pose(kf.id), kf.pose);
-        
-        // 5. ISAM2 업데이트
-        if (keyframe_manager_.shouldAddKeyframe(kf.pose, last_kf_pose_)) {
-            optimizer_.update(new_factors_, new_values_);
-            new_factors_.resize(0);
-            new_values_.clear();
-        }
-    }
-};
+        # 2. 랜드마크 관측 팩터 추가
+        for match in matches:
+            # ...
+            add_landmark_factor(...)
+
+        # 3. 초기값 설정
+        self.new_values.insert(pose_key(keyframe.id), keyframe.pose)
+
+        # 4. ISAM2 업데이트
+        self.optimizer.update(self.new_factors, self.new_values)
+        self.new_values.clear()
+        self.new_factors.resize(0)
 ```
 
 ## 7. 디버깅 및 시각화
 
 ### 7.1 Factor Graph 시각화
 
-```cpp
-void visualizeFactorGraph(const gtsam::NonlinearFactorGraph& graph,
-                         const gtsam::Values& values) {
-    // GraphViz dot 파일 생성
-    graph.saveGraph("factor_graph.dot", values);
-    
-    // 각 팩터의 에러 출력
-    for (size_t i = 0; i < graph.size(); ++i) {
-        double error = graph[i]->error(values);
-        spdlog::debug("Factor {}: error = {:.6f}", i, error);
-    }
-}
+```python
+def visualize_factor_graph(graph, values):
+    # GraphViz dot 파일 생성
+    dot_string = graph.dot(values)
+    with open("factor_graph.dot", "w") as f:
+        f.write(dot_string)
 ```
 
 ### 7.2 공분산 추출
 
-```cpp
-gtsam::Matrix extractPoseCovariance(const gtsam::ISAM2& isam2,
-                                   gtsam::Key pose_key) {
-    try {
-        return isam2.marginalCovariance(pose_key);
-    } catch (const gtsam::IndeterminantLinearSystemException& e) {
-        spdlog::warn("Cannot compute marginal covariance");
-        return gtsam::Matrix::Identity(3, 3) * 1e6;
-    }
-}
+```python
+def extract_pose_covariance(isam2, pose_idx):
+    try:
+        return isam2.marginalCovariance(pose_key(pose_idx))
+    except Exception as e:
+        print(f"Cannot compute marginal covariance: {e}")
+        return np.eye(3) * 1e6
 ```
 
 ## 8. 성능 최적화 팁
@@ -483,7 +253,7 @@ gtsam::Matrix extractPoseCovariance(const gtsam::ISAM2& isam2,
 1. **배치 업데이트**: 매 프레임마다 최적화하지 않고 키프레임 단위로
 2. **변수 순서**: 시간 순서대로 변수 추가 (ISAM2 효율성)
 3. **스파스성 활용**: 불필요한 팩터 연결 최소화
-4. **병렬 처리**: 팩터 생성은 병렬화 가능
+4. **Numba/Cython**: 순수 Python으로 구현된 계산 집약적 로직(에러 함수 등) 가속화
 
 ## 9. 주의사항
 

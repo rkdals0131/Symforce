@@ -72,21 +72,21 @@
 - 모듈화된 시스템 구조로 개발 및 디버깅 용이
 - 기존 시스템과의 통합 간편
 
-### 3.2 현재 모듈 구성
+### 3.2 현재 모듈 구성 (Python 기반)
 
 **현재 구현 완료:**
 - **simulation/**: 비침습적 테스트 애드온
   - dummy_publisher_node.py: 현실적 센서 시뮬레이션
-  - cone_definitions.py: 트랙 시나리오 정의
+  - cone_definitions.py: 트��� 시나리오 정의
 - **slam_core/**: SLAM 알고리즘 구현체
   - cone_color_factor.py: SymForce 기반 색상 팩터
 - **utils/**: 공통 데이터 구조
   - data_structures.py: SLAM 핵심 데이터 타입
-- **ros_bridge/**: ROS2 인터페이스 (구현 예정)
+- **ros_bridge/**: ROS2 인터페이스
 
-**향후 구현 예정 (C++):**
+**향후 구현 예정 (Python):**
 - **센서 전처리 모듈:** IMU, GPS, 콘 데이터의 전처리 및 좌표계 변환
-- **프론트엔드 모듈:** 키프레임 선정, 초기 자세 예측, 콘 데이터 연관
+- **프론트엔드 모듈:** 키프레임 선정, 초기 자세 예측, 강건한 데이터 연관
 - **백엔드 최적화 모듈:** GTSAM/Symforce 기반 그래프 최적화
 - **맵 관리 모듈:** 랜드마크 데이터베이스 관리 및 맵 업데이트
 - **시각화 모듈:** RViz2를 통한 실시간 시각화
@@ -180,28 +180,28 @@ GLIM과 유사하게 각 모듈은 비동기적으로 동작하여 실시간 성
 
 각 데이터 구조는 GTSAM과의 원활한 통합을 위해 변환 메서드를 포함합니다.
 
-## 6. 기술 스택 (Python 우선 접근법)
+## 6. 기술 스택 (Python-Only 접근법)
 
 ### 6.1 전체 시스템 구현 (Python 기반)
-- **프로그래밍 언어:** Python 3.8+
+- **프로그래밍 언어:** Python 3.10
 - **ROS 버전:** ROS2 Humble
 - **SLAM 라이브러리:** 
   - GTSAM Python wrapper (내부적으로 C++ 최적화)
-  - SymForce (자동 C++ 코드 생성)
+  - SymForce (Python 기반 정의 및 코드 생성)
 - **주요 라이브러리:** NumPy, SciPy, Matplotlib
 - **메시지 인터페이스:** custom_interface.msg.TrackedConeArray
 
 ### 6.2 성능 최적화 전략
-- **SymForce codegen**: 최적화된 C++ 팩터 자동 생성
-- **GTSAM Python wrapper**: 내부 C++ 라이브러리 활용
-- **프로파일링 기반**: 병목 지점만 선택적 C++ 최적화
-- **Numba/Cython**: 필요시 Python 코드 가속화
+- **SymForce codegen**: Python으로 정의된 팩터로부터 최적화된 Python/C++ 코드 생성
+- **GTSAM Python wrapper**: C++로 구현된 핵심 최적화 알고리즘 활용
+- **프로파일링 기반**: `cProfile`, `line_profiler` 등으로 병목 지점 분석
+- **Numba/Cython**: 필요시 순수 Python 함수 가속화
 
 ### 6.3 개발 우선순위 (Formula Student 최적화)
-1. **빠른 프로토타이핑**: Python의 개발 속도 활용
-2. **실제 데이터 검증**: 조기 센서 통합 및 테스트
-3. **성능 프로파일링**: 실제 병목 지점 정확한 파악
-4. **선택적 최적화**: 필요한 부분만 C++로 최적화
+1. **빠른 프로토타이핑**: Python의 높은 생산성을 활용하여 핵심 기능 빠르게 구현
+2. **실제 데이터 검증**: 조기 센서 통합 및 테��트를 통해 알고리즘 검증
+3. **성능 프로파일링**: 실제 병목 지점을 정확히 파악
+4. **선택적 최적화**: Symforce 코드 생성 및 Numba/Cython을 활용하여 필요한 부분만 성능 최적화
 
 ## 7. 성능 요구사항
 
@@ -240,14 +240,14 @@ GLIM과 유사하게 각 모듈은 비동기적으로 동작하여 실시간 성
 - Outlier rejection 및 robustness 개선
 
 ### 📋 Phase 4: 실제 센서 통합 & 프로파일링 (2-3주)
-- ROS2 Python bridge 개발 (실제 센서 데이터 처리)
+- ROS2 Python bridge를 통해 실제 센서 데이터 처리
 - 실제 트랙 데이터 테스트
 - **성능 프로파일링**: 병목 지점 정확한 측정
-- 필요시 선택적 C++ 최적화
+- 필요시 선택적 Python 최적화 (Numba, Cython 등)
 
 ### 📋 Phase 5: 고급 기능 및 대회 준비 (2-3주)
 - Loop closure detection 구현
-- 전체 시스템 성능 최적화 (Python + selective C++)
+- 전체 시스템 성능 최적화 (Python + Symforce codegen)
 - Formula Student 대회 준비
 
 **현재 진행률:** Phase 0 완료, Phase 1 준비 중
