@@ -3,9 +3,9 @@
 SLAM Core Module
 
 Contains the main SLAM algorithms:
-- Backend: Factor graph optimization using GTSAM and SymForce  
+- Backend: Factor graph optimization using GTSAM with SymForce-generated factors
 - Frontend: Data association, feature extraction
-- Loop Closure: Place recognition and loop detection
+- SymForce Integration: Optimized factor computation with analytical Jacobians
 """
 
 # Import data association module
@@ -26,33 +26,25 @@ try:
 except ImportError:
     pass
 
-# Import SLAM system
-try:
-    from .slam_system import SlamSystem, SlamSystemConfig
-except ImportError:
-    pass
-
-# Import visualizer
-try:
-    from .slam_visualizer import SlamVisualizer, SlamAnimator
-except ImportError:
-    pass
-
-# Import cone color factor if available
-try:
-    from .cone_color_factor import ConeColorFactor
-except (ImportError, AttributeError) as e:
-    # SymForce may not be available or configured
-    pass
-
-# Import custom factors
-try:
-    from .custom_factors import ConeObservationFactor
-except ImportError:
-    pass
-
 # Import local map
 try:
     from .local_map import LocalMap, LocalMapConfig
 except ImportError:
+    pass
+
+# Import SymForce-GTSAM integration
+try:
+    from .symforce_gtsam_factors_stable import (
+        create_symforce_cone_factor,
+        create_symforce_motion_factor,
+        color_string_to_float
+    )
+except ImportError:
+    pass
+
+# Import cone color factor for code generation
+try:
+    from .cone_color_factor import ConeColorFactor
+except (ImportError, AttributeError):
+    # SymForce may not be available or configured
     pass

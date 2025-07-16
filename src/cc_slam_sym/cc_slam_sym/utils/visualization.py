@@ -39,8 +39,21 @@ class VisualizationHelper:
     @staticmethod
     def create_cone_marker(position: np.ndarray, color: str, marker_id: int, 
                           namespace: str = "cones", frame_id: str = "map",
-                          timestamp: Optional[object] = None, ground_truth: bool = False) -> Marker:
-        """Create a cone marker (cylinder)"""
+                          timestamp: Optional[object] = None, ground_truth: bool = False,
+                          marker_type: int = Marker.CYLINDER, alpha: float = None) -> Marker:
+        """Create a cone marker
+        
+        Args:
+            position: Position array [x, y] 
+            color: Color name ('yellow', 'blue', 'red', etc.)
+            marker_id: Unique marker ID
+            namespace: Marker namespace
+            frame_id: TF frame ID
+            timestamp: ROS timestamp
+            ground_truth: Whether this is a ground truth marker
+            marker_type: Marker type (Marker.CYLINDER, Marker.SPHERE, etc.)
+            alpha: Custom transparency (0.0-1.0), overrides color default
+        """
         marker = Marker()
         
         # Header
@@ -53,7 +66,7 @@ class VisualizationHelper:
         marker.id = marker_id
         
         # Type and action
-        marker.type = Marker.CYLINDER
+        marker.type = marker_type
         marker.action = Marker.ADD
         
         # Pose
@@ -80,7 +93,8 @@ class VisualizationHelper:
             marker.color.r = color_tuple[0]
             marker.color.g = color_tuple[1]
             marker.color.b = color_tuple[2]
-            marker.color.a = color_tuple[3]
+            # Use custom alpha if provided, otherwise use default from color tuple
+            marker.color.a = alpha if alpha is not None else color_tuple[3]
         
         # Lifetime (0 = forever)
         marker.lifetime = rclpy.duration.Duration(seconds=0).to_msg()
@@ -332,14 +346,16 @@ def publish_detected_cones(publisher, detected_cones: List[Tuple[int, np.ndarray
     
     # Add detected cone markers
     for idx, (track_id, position, cone_type) in enumerate(detected_cones):
-        # Cone marker
+        # Cone marker (semi-transparent sphere for detected cones)
         cone_marker = VisualizationHelper.create_cone_marker(
             position=position,
             color=cone_type,
             marker_id=idx * 2,
             namespace=namespace,
             frame_id=frame_id,
-            timestamp=timestamp
+            timestamp=timestamp,
+            marker_type=Marker.SPHERE,
+            alpha=0.4
         )
         marker_array.markers.append(cone_marker)
         

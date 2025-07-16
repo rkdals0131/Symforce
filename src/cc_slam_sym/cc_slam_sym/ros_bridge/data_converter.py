@@ -107,13 +107,28 @@ class RosSlamConverter:
         # Extract angular velocity (just z component)
         angular_velocity = msg.twist.twist.angular.z
         
+        # Extract pose covariance (x, y, theta)
+        # ROS Odometry covariance is 6x6 (x,y,z,roll,pitch,yaw)
+        # We extract 2D covariance: x(0), y(7), yaw(35)
+        pose_cov = np.zeros((3, 3))
+        pose_cov[0, 0] = msg.pose.covariance[0]    # x variance
+        pose_cov[0, 1] = msg.pose.covariance[1]    # x-y covariance
+        pose_cov[1, 0] = msg.pose.covariance[6]    # y-x covariance
+        pose_cov[1, 1] = msg.pose.covariance[7]    # y variance
+        pose_cov[0, 2] = msg.pose.covariance[5]    # x-yaw covariance
+        pose_cov[2, 0] = msg.pose.covariance[30]   # yaw-x covariance
+        pose_cov[1, 2] = msg.pose.covariance[11]   # y-yaw covariance
+        pose_cov[2, 1] = msg.pose.covariance[31]   # yaw-y covariance
+        pose_cov[2, 2] = msg.pose.covariance[35]   # yaw variance
+        
         # Create odometry data
         odom_data = OdometryData(
             timestamp=msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
             position=position,
             orientation=yaw,
             linear_velocity=linear_velocity,
-            angular_velocity=angular_velocity
+            angular_velocity=angular_velocity,
+            covariance=pose_cov
         )
         
         return odom_data

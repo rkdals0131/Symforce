@@ -84,6 +84,9 @@ class DataAssociation:
         
         # If we have mahalanobis distance enabled
         if self.config.use_mahalanobis and robot_pose is not None:
+            # Use predicted pose if available for better matching
+            pose_for_association = predicted_pose if predicted_pose is not None else robot_pose
+            
             # Extract positions for KD-tree (for efficient candidate search)
             lm_positions = np.array([[lm.position[0], lm.position[1]] 
                                      for lm in landmarks])
@@ -91,8 +94,8 @@ class DataAssociation:
             
             # Process each observation
             for obs_idx, observation in enumerate(observations):
-                # Transform observation to world frame
-                obs_world = robot_pose.transformFrom(observation.position[:2])
+                # Transform observation to world frame using predicted pose
+                obs_world = pose_for_association.transformFrom(observation.position[:2])
                 
                 # Find candidate landmarks within a reasonable radius
                 candidate_indices = kdtree.query_ball_point(
@@ -121,7 +124,7 @@ class DataAssociation:
                     
                     # Combine covariances: observation + landmark
                     # Transform observation covariance to world frame
-                    R = robot_pose.rotation().matrix()  # 2x2 rotation matrix
+                    R = pose_for_association.rotation().matrix()  # 2x2 rotation matrix
                     obs_cov_world = R @ observation.covariance[:2, :2] @ R.T
                     
                     # Innovation covariance

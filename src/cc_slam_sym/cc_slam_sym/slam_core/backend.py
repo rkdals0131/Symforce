@@ -14,14 +14,13 @@ from ..utils.data_structures import (
     Keyframe, Landmark, ConeCluster, 
     ImuData, GpsData
 )
-from .custom_factors import ConeObservationFactor, create_cone_observation_factor
 
-# Try to import SymForce factors
-try:
-    from .symforce_factors import SymforceFactors
-    SYMFORCE_AVAILABLE = True
-except ImportError:
-    SYMFORCE_AVAILABLE = False
+# Import SymForce-GTSAM integrated factors
+from .symforce_gtsam_factors_stable import (
+    create_symforce_cone_factor,
+    create_symforce_motion_factor,
+    color_string_to_float
+)
 
 
 @dataclass
@@ -43,6 +42,10 @@ class BackendConfig:
     # Robust kernels
     use_robust_kernels: bool = True
     huber_parameter: float = 1.0            # Huber robust kernel parameter
+    
+    # Outlier rejection
+    chi2_threshold: float = 9.0             # Chi-squared threshold for outlier rejection (99% for 2 DOF)
+    remove_outliers: bool = True            # Enable outlier removal after optimization
     
     # Sliding window
     use_sliding_window: bool = True
@@ -96,8 +99,12 @@ class SlamBackend:
             "total_time": 0.0,
             "average_time": 0.0,
             "last_error": 0.0,
-            "factors_per_optimization": 0
+            "factors_per_optimization": 0,
+            "outliers_removed": 0
         }
+        
+        # Track factors for outlier removal
+        self.factor_keys = []  # Store factor indices
         
     def add_prior(self, keyframe: Keyframe):
         """Add prior factor for the first keyframe
@@ -127,7 +134,7 @@ class SlamBackend:
                            keyframe1: Keyframe, 
                            keyframe2: Keyframe,
                            relative_pose: Optional[gtsam.Pose2] = None):
-        """Add odometry factor between consecutive keyframes
+        """Add odometry factor between consecutive keyframes using SymForce
         
         Args:
             keyframe1: Previous keyframe
@@ -138,28 +145,43 @@ class SlamBackend:
         if relative_pose is None:
             relative_pose = keyframe1.pose.between(keyframe2.pose)
             
-        # Create noise model
-        noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
-            self.config.odometry_position_noise,
-            self.config.odometry_position_noise,
-            self.config.odometry_rotation_noise
-        ]))
-        
-        # Apply robust kernel if enabled
-        if self.config.use_robust_kernels:
-            noise = gtsam.noiseModel.Robust.Create(
-                gtsam.noiseModel.mEstimator.Huber.Create(self.config.huber_parameter),
-                noise
-            )
+        # Check for unreasonable motion (vehicle constraints)
+        dt = keyframe2.timestamp - keyframe1.timestamp
+        if dt > 0:
+            # Extract motion components
+            dx = relative_pose.x()
+            dy = relative_pose.y()
+            dtheta = relative_pose.theta()
             
-        # Add between factor
-        between_factor = gtsam.BetweenFactorPose2(
+            # Calculate velocities
+            linear_vel = np.sqrt(dx**2 + dy**2) / dt
+            angular_vel = abs(dtheta) / dt
+            
+            # Vehicle constraints (reasonable for a car)
+            max_linear_vel = 10.0  # m/s (36 km/h)
+            max_angular_vel = 2.0  # rad/s (about 115 deg/s)
+            
+            # Scale noise if motion seems unreasonable
+            motion_scale = 1.0
+            if linear_vel > max_linear_vel:
+                motion_scale *= (linear_vel / max_linear_vel)
+                print(f"Warning: High linear velocity {linear_vel:.2f} m/s")
+            if angular_vel > max_angular_vel:
+                motion_scale *= (angular_vel / max_angular_vel)
+                print(f"Warning: High angular velocity {angular_vel:.2f} rad/s")
+        else:
+            motion_scale = 1.0
+            
+        # Create SymForce motion factor with Ackermann constraints
+        factor = create_symforce_motion_factor(
             keyframe1.pose_symbol,
             keyframe2.pose_symbol,
             relative_pose,
-            noise
+            position_noise=self.config.odometry_position_noise * motion_scale,
+            rotation_noise=self.config.odometry_rotation_noise * motion_scale,
+            wheelbase=0.3  # Formula Student car wheelbase
         )
-        self.graph.add(between_factor)
+        self.graph.add(factor)
         
         # Add initial value for new keyframe
         if not self.initial_values.exists(keyframe2.pose_symbol):
@@ -169,110 +191,43 @@ class SlamBackend:
                                keyframe: Keyframe,
                                landmark: Landmark,
                                observation: ConeCluster):
-        """Add landmark observation factor with color information using SymForce
+        """Add landmark observation factor using SymForce-generated functions
         
         Args:
             keyframe: Observing keyframe
             landmark: Observed landmark
             observation: Cone observation (in robot frame)
         """
-        # Use SymForce for residual and Jacobian computation if available
-        if SYMFORCE_AVAILABLE:
-            try:
-                # Get current poses for Jacobian computation
-                if self.current_estimate and self.current_estimate.exists(keyframe.pose_symbol):
-                    current_pose = self.current_estimate.atPose2(keyframe.pose_symbol)
-                    robot_pose = np.array([current_pose.x(), current_pose.y(), current_pose.theta()])
-                else:
-                    robot_pose = np.array([keyframe.pose.x(), keyframe.pose.y(), keyframe.pose.theta()])
-                
-                if self.current_estimate and self.current_estimate.exists(landmark.symbol):
-                    current_landmark = self.current_estimate.atPoint2(landmark.symbol)
-                    landmark_pos = np.array([current_landmark[0], current_landmark[1]])
-                else:
-                    # Initial estimate
-                    obs_world = keyframe.pose.transformFrom(observation.position[:2])
-                    landmark_pos = obs_world
-                
-                # Convert colors to scalars
-                observed_color = 0.0 if observation.color == "yellow" else (
-                                1.0 if observation.color == "blue" else (
-                                2.0 if observation.color == "red" else -1.0))
-                landmark_color = 0.0 if landmark.color == "yellow" else (
-                               1.0 if landmark.color == "blue" else (
-                               2.0 if landmark.color == "red" else -1.0))
-                
-                # Dynamic color weight based on voting confidence
-                if landmark.observations > 0:
-                    total_votes = sum(landmark.color_votes.values())
-                    if total_votes > 0:
-                        confidence = max(landmark.color_votes.values()) / total_votes
-                        color_weight = 5.0 * confidence
-                    else:
-                        color_weight = 1.0
-                else:
-                    color_weight = 1.0
-                
-                # Compute residual and Jacobians using SymForce
-                residual, jacobians = SymforceFactors.cone_observation_residual_and_jacobian(
-                    robot_pose=robot_pose,
-                    landmark_pos=landmark_pos,
-                    observation=observation.position[:2],
-                    observed_color=observed_color,
-                    landmark_color=landmark_color,
-                    color_weight=color_weight
-                )
-                
-                # Create custom factor with precomputed Jacobians
-                # For now, fall back to standard factor until custom factor is properly integrated
-                
-            except Exception as e:
-                print(f"SymForce computation failed: {e}, falling back to standard factor")
-        
-        # Use standard BearingRangeFactor2D with color-based noise scaling
-        # Get color match confidence
-        color_matches = (observation.color == landmark.color or 
-                        observation.color == "unknown" or 
-                        landmark.color == "unknown")
-        
-        # Scale noise based on color match
-        base_noise = self.config.landmark_observation_noise
-        if not color_matches:
-            # Increase uncertainty for color mismatch
-            noise_scale = 2.0  # Make observation less trusted
+        # Get color confidence from landmark voting
+        if landmark.observation_count > 0:
+            total_votes = sum(landmark.color_votes.values())
+            if total_votes > 0:
+                confidence = max(landmark.color_votes.values()) / total_votes
+                color_weight = 5.0 * confidence  # Scale weight by confidence
+            else:
+                color_weight = 1.0
         else:
-            noise_scale = 1.0
+            color_weight = 1.0
             
-        # Create noise model
-        noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
-            base_noise * noise_scale,
-            base_noise * noise_scale
-        ]))
-        
-        # Apply robust kernel
-        if self.config.use_robust_kernels:
-            noise = gtsam.noiseModel.Robust.Create(
-                gtsam.noiseModel.mEstimator.Huber.Create(self.config.huber_parameter),
-                noise
-            )
-        
-        # Use standard BearingRangeFactor2D
-        # Transform observation to bearing and range
-        obs_x, obs_y = observation.position[0], observation.position[1]
-        bearing = gtsam.Rot2(np.arctan2(obs_y, obs_x))
-        range_val = np.sqrt(obs_x**2 + obs_y**2)
-        
-        factor = gtsam.BearingRangeFactor2D(
-            keyframe.pose_symbol,
-            landmark.symbol,
-            bearing,
-            range_val,
-            noise
+        # Create SymForce cone observation factor
+        factor = create_symforce_cone_factor(
+            pose_key=keyframe.pose_symbol,
+            landmark_key=landmark.symbol,
+            observation=observation.position[:2],
+            obs_color=observation.color,
+            landmark_color=landmark.color,
+            position_noise=self.config.landmark_observation_noise,
+            color_weight=color_weight,
+            use_bearing_range=False  # Use Cartesian formulation
         )
         
         # Add factor to graph
         self.graph.add(factor)
         self.factors_since_optimization += 1
+        
+        # Track factor for potential outlier removal
+        factor_key = self.graph.size() - 1
+        self.factor_keys.append((factor_key, 'observation', keyframe.pose_symbol, landmark.symbol))
         
         # Initialize landmark if first observation
         if not self.initial_values.exists(landmark.symbol):
@@ -319,7 +274,7 @@ class SlamBackend:
                         keyframe2: Keyframe,
                         relative_pose: gtsam.Pose2,
                         confidence: float = 1.0):
-        """Add loop closure constraint
+        """Add loop closure constraint using SymForce motion factor
         
         Args:
             keyframe1: First keyframe in loop
@@ -327,24 +282,20 @@ class SlamBackend:
             relative_pose: Measured relative pose
             confidence: Loop closure confidence (0-1)
         """
-        # Scale noise based on confidence
-        base_noise = np.array([
-            self.config.odometry_position_noise * 2,
-            self.config.odometry_position_noise * 2,
-            self.config.odometry_rotation_noise * 2
-        ])
-        scaled_noise = base_noise / confidence
+        # Scale noise based on confidence (lower confidence = higher noise)
+        position_noise = self.config.odometry_position_noise * 2 / confidence
+        rotation_noise = self.config.odometry_rotation_noise * 2 / confidence
         
-        noise = gtsam.noiseModel.Diagonal.Sigmas(scaled_noise)
-        
-        # Add loop closure factor
-        loop_factor = gtsam.BetweenFactorPose2(
+        # Create SymForce motion factor for loop closure
+        factor = create_symforce_motion_factor(
             keyframe1.pose_symbol,
             keyframe2.pose_symbol,
             relative_pose,
-            noise
+            position_noise=position_noise,
+            rotation_noise=rotation_noise,
+            wheelbase=0.3  # Same as odometry
         )
-        self.graph.add(loop_factor)
+        self.graph.add(factor)
         
     def optimize(self) -> bool:
         """Run optimization on the factor graph with performance improvements
@@ -356,20 +307,56 @@ class SlamBackend:
             start_time = time.time()
             
             # Skip optimization if not enough new factors
-            if self.factors_since_optimization < 10 and self.new_values_count < 5:
+            # Only require a minimal number to avoid empty optimizations
+            if self.factors_since_optimization < 2:
                 return True
             
-            # Update ISAM2 with new factors
-            self.isam2.update(self.graph, self.initial_values)
+            # Use batch optimization instead of ISAM2 due to CustomFactor issues
+            # Build combined values
+            combined_values = gtsam.Values()
+            
+            # Add current estimates
+            if self.current_estimate:
+                for key in self.current_estimate.keys():
+                    try:
+                        if chr(gtsam.Symbol(key).chr()) == 'x':
+                            combined_values.insert(key, self.current_estimate.atPose2(key))
+                        elif chr(gtsam.Symbol(key).chr()) == 'l':
+                            combined_values.insert(key, self.current_estimate.atPoint2(key))
+                    except:
+                        pass
+            
+            # Add new values
+            for key in self.initial_values.keys():
+                if not combined_values.exists(key):
+                    try:
+                        if chr(gtsam.Symbol(key).chr()) == 'x':
+                            combined_values.insert(key, self.initial_values.atPose2(key))
+                        elif chr(gtsam.Symbol(key).chr()) == 'l':
+                            combined_values.insert(key, self.initial_values.atPoint2(key))
+                    except:
+                        pass
+            
+            # Batch optimization
+            optimizer_params = gtsam.LevenbergMarquardtParams()
+            optimizer_params.setVerbosity("SILENT")
+            optimizer_params.setMaxIterations(100)
+            optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, combined_values, optimizer_params)
+            self.current_estimate = optimizer.optimize()
             
             # Clear for next iteration
             self.graph = gtsam.NonlinearFactorGraph()
             self.initial_values.clear()
             self.factors_since_optimization = 0
             self.new_values_count = 0
+            self.factor_keys.clear()
             
             # Get current estimate
             self.current_estimate = self.isam2.calculateEstimate()
+            
+            # Remove outliers if enabled
+            if self.config.remove_outliers:
+                self._remove_outliers()
             
             # Update landmark positions and covariances
             self._update_landmark_estimates()
@@ -389,7 +376,7 @@ class SlamBackend:
             
             # Calculate error
             try:
-                self.optimization_stats["last_error"] = self.isam2.error(self.current_estimate)
+                self.optimization_stats["last_error"] = self.graph.error(self.current_estimate)
             except:
                 pass
             
@@ -560,6 +547,68 @@ class SlamBackend:
             # Save to GraphViz format
             self.graph.saveGraph(filename + "_graph.dot", self.current_estimate)
             
+    def _remove_outliers(self):
+        """Remove factors with high error (outliers) from the graph"""
+        if not self.current_estimate:
+            return
+            
+        try:
+            # Get all factors from ISAM2
+            graph = self.isam2.getFactorsUnsafe()
+            
+            factors_to_remove = []
+            
+            # Check each factor's error
+            for i in range(graph.size()):
+                factor = graph.at(i)
+                if factor is None:
+                    continue
+                    
+                try:
+                    # Calculate unwhitened error for this factor
+                    error = factor.unwhitenedError(self.current_estimate)
+                    chi2_error = np.dot(error, error)
+                    
+                    # For bearing-range factors, we have 2 DOF
+                    # Chi-squared threshold at 99% confidence for 2 DOF is ~9.21
+                    if chi2_error > self.config.chi2_threshold:
+                        factors_to_remove.append(i)
+                        
+                except Exception:
+                    # Skip factors that can't compute error
+                    continue
+            
+            # Remove outlier factors
+            if factors_to_remove:
+                # Create new graph without outliers
+                new_graph = gtsam.NonlinearFactorGraph()
+                for i in range(graph.size()):
+                    if i not in factors_to_remove:
+                        factor = graph.at(i)
+                        if factor is not None:
+                            new_graph.add(factor)
+                
+                # Re-initialize ISAM2 with cleaned graph
+                # Need to recreate params since ISAM2.params() might not work
+                params = gtsam.ISAM2Params()
+                params.setRelinearizeThreshold(self.config.relinearize_threshold)
+                params.relinearizeSkip = self.config.relinearize_skip
+                params.enableRelinearization = True
+                params.evaluateNonlinearError = False
+                params.setFactorization("QR")
+                params.cacheLinearizedFactors = True
+                params.enableDetailedResults = False
+                
+                self.isam2 = gtsam.ISAM2(params)
+                self.isam2.update(new_graph, self.current_estimate)
+                
+                # Update statistics
+                self.optimization_stats["outliers_removed"] += len(factors_to_remove)
+                print(f"Removed {len(factors_to_remove)} outlier factors")
+                
+        except Exception as e:
+            print(f"Outlier removal failed: {e}")
+    
     def reset(self):
         """Reset the backend to initial state"""
         self.graph = gtsam.NonlinearFactorGraph()
@@ -574,3 +623,4 @@ class SlamBackend:
         self.optimized_landmarks.clear()
         self.keyframe_count = 0
         self.landmark_count = 0
+        self.factor_keys.clear()

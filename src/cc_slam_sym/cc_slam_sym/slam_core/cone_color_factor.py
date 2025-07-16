@@ -105,7 +105,7 @@ class ConeColorFactor:
             """
             # Transform landmark to robot frame
             landmark_in_world = sf.V3(landmark_pos[0], landmark_pos[1], 1)
-            T_world_robot = robot_pose.to_homogeneous_matrix()
+            T_world_robot = robot_pose.to_homogenous_matrix()
             T_robot_world = T_world_robot.inv()
             
             landmark_in_robot_homo = T_robot_world * landmark_in_world
@@ -236,7 +236,7 @@ def test_cone_color_factor():
     print(f"  Color component: {residual2[2]}")
     
     # Generate code
-    print("\nGenerating C++ code...")
+    print("\nGenerating optimized Python code...")
     output_dir = ConeColorFactor.generate_code()
     print(f"Code generated in: {output_dir}")
 

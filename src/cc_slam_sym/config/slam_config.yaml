@@ -29,9 +29,12 @@
       max_landmark_init_distance: 20.0    # Maximum distance to initialize landmark
       
       # Noise Models
-      odometry_position_noise: 0.1        # meters
-      odometry_rotation_noise: 0.05       # radians
-      landmark_position_noise: 0.2        # meters
+      # IMPORTANT: These should match the actual sensor noise!
+      # With simulated perfect odometry (noise=0), use very small values
+      odometry_position_noise: 0.001      # meters (nearly perfect)
+      odometry_rotation_noise: 0.001      # radians (nearly perfect)
+      landmark_position_noise: 0.2        # meters (keep realistic for cones)
+      use_odometry_covariance: false      # If true, use covariance from odometry messages
     
     # Backend Configuration
     backend:
@@ -42,15 +45,20 @@
       relinearize_skip: 10                # ISAM2 relinearization skip
       
       # Noise Models
-      prior_position_noise: 0.1           # meters
-      prior_rotation_noise: 0.05          # radians
-      odometry_position_noise: 0.2        # meters
-      odometry_rotation_noise: 0.1        # radians
-      landmark_observation_noise: 0.3     # meters
+      # IMPORTANT: Match actual sensor characteristics!
+      prior_position_noise: 0.001         # meters (we know starting position well)
+      prior_rotation_noise: 0.001         # radians (we know starting orientation)
+      odometry_position_noise: 0.001      # meters (perfect simulated odometry)
+      odometry_rotation_noise: 0.001      # radians (perfect simulated odometry)
+      landmark_observation_noise: 0.3     # meters (keep realistic for cone detection)
       
       # Robust Kernels
       use_robust_kernels: true
       huber_parameter: 1.0                # Huber robust kernel parameter
+      
+      # Outlier Rejection
+      chi2_threshold: 9.0                 # Chi-squared threshold for 2 DOF at 99% confidence
+      remove_outliers: true               # Enable automatic outlier removal
       
       # Sliding Window
       use_sliding_window: true

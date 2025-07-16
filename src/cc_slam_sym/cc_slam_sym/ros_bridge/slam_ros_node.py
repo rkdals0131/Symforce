@@ -333,8 +333,14 @@ class SlamNode(Node):
                                     break
                         
                         # Check if optimization should run
-                        if len(self.backend.keyframes) % self.backend.config.optimization_interval == 0:
+                        # Track keyframes since last optimization
+                        if not hasattr(self, 'keyframes_since_optimization'):
+                            self.keyframes_since_optimization = 0
+                        self.keyframes_since_optimization += 1
+                        
+                        if self.keyframes_since_optimization >= self.backend.config.optimization_interval:
                             self._perform_optimization()
+                            self.keyframes_since_optimization = 0
                         
                         self.get_logger().debug(f"Backend now has {len(self.backend.keyframes)} keyframes")
                             

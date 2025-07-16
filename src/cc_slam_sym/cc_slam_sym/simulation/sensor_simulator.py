@@ -453,12 +453,26 @@ class OdometrySimulator:
         odom_msg.twist.twist.linear.y = true_vy
         odom_msg.twist.twist.angular.z = true_vtheta
         
-        # Covariances (reflect drift uncertainty)
-        # Pose covariance grows with distance traveled
+        # Covariances (reflect actual noise and drift configuration)
+        # Base covariance from configured noise levels
         pose_cov = np.zeros(36)
-        pose_cov[0] = max(0.001, self.total_distance * 0.001)**2  # x uncertainty
-        pose_cov[7] = max(0.001, self.total_distance * 0.001)**2  # y uncertainty  
-        pose_cov[35] = max(0.001, self.total_rotation * 0.001)**2  # theta uncertainty
+        
+        # Position covariance based on systematic drift and random noise
+        # X uncertainty: combination of systematic drift and random noise
+        x_systematic_var = (self.config.odom_drift_x_systematic * 0.01 * self.total_distance)**2
+        x_random_var = self.config.odom_drift_x_random**2
+        pose_cov[0] = x_systematic_var + x_random_var + 0.001**2  # x uncertainty
+        
+        # Y uncertainty: lateral drift effects
+        y_systematic_var = (self.config.odom_drift_y_systematic * 0.01 * self.total_distance)**2
+        y_random_var = self.config.odom_drift_y_random**2
+        pose_cov[7] = y_systematic_var + y_random_var + 0.001**2  # y uncertainty
+        
+        # Theta uncertainty: heading drift
+        theta_systematic_var = (self.config.odom_drift_theta_systematic * 0.01 * self.total_rotation)**2
+        theta_random_var = (self.config.odom_drift_theta_random * np.pi/180)**2  # Convert deg to rad
+        pose_cov[35] = theta_systematic_var + theta_random_var + 0.001**2  # theta uncertainty
+        
         odom_msg.pose.covariance = pose_cov.tolist()
         
         # Twist covariance (fixed small values)

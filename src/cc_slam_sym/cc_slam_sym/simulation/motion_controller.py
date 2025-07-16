@@ -10,7 +10,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
-from scipy.interpolate import splprep, splev
+from scipy.interpolate import splprep, splev, interp1d
 
 
 class MotionScenario(Enum):
@@ -184,6 +184,104 @@ class TrajectoryGenerator:
         return smoothed
 
 
+class ContinuousTrajectory:
+    """Continuous spline-based trajectory for smooth motion"""
+    
+    def __init__(self, waypoints: List[Tuple[float, float]], is_closed: bool = True):
+        """
+        Initialize continuous trajectory from waypoints
+        
+        Args:
+            waypoints: List of (x, y) waypoint coordinates
+            is_closed: Whether the trajectory is closed (forms a loop)
+        """
+        # Convert to numpy arrays
+        waypoints_array = np.array(waypoints)
+        x = waypoints_array[:, 0]
+        y = waypoints_array[:, 1]
+        
+        # Create spline representation
+        smoothing_factor = 0.02 if is_closed else 0.05
+        self.tck, self.u = splprep([x, y], s=smoothing_factor * len(waypoints), per=is_closed)
+        self.is_closed = is_closed
+        
+        # Create distance mapping for arc-length parameterization
+        self._create_distance_mapping()
+    
+    def _create_distance_mapping(self):
+        """Create mapping from distance to spline parameter u"""
+        # Sample the spline at high resolution
+        u_samples = np.linspace(0, 1, 2000)
+        positions = splev(u_samples, self.tck)
+        
+        # Calculate cumulative distances
+        distances = [0.0]
+        for i in range(1, len(positions[0])):
+            dx = positions[0][i] - positions[0][i-1]
+            dy = positions[1][i] - positions[1][i-1]
+            distances.append(distances[-1] + np.sqrt(dx**2 + dy**2))
+        
+        # Create interpolation function: distance → u_param
+        self.distance_to_u = interp1d(distances, u_samples, 
+                                     kind='linear', bounds_error=False, 
+                                     fill_value=(0, 1))
+        self.total_distance = distances[-1]
+    
+    def get_position_and_heading(self, distance: float) -> Tuple[np.ndarray, float]:
+        """
+        Get position and heading at given distance along trajectory
+        
+        Args:
+            distance: Distance along trajectory
+            
+        Returns:
+            Tuple of (position, heading) where position is [x, y] and heading is in radians
+        """
+        # Handle closed trajectories by wrapping distance
+        if self.is_closed:
+            distance = distance % self.total_distance
+        else:
+            distance = np.clip(distance, 0, self.total_distance)
+        
+        # Convert distance to spline parameter
+        u_param = self.distance_to_u(distance)
+        
+        # Get position (0th derivative)
+        pos = splev(u_param, self.tck, der=0)
+        position = np.array([pos[0], pos[1]])
+        
+        # Get tangent vector (1st derivative) for heading
+        tangent = splev(u_param, self.tck, der=1)
+        heading = np.arctan2(tangent[1], tangent[0])
+        
+        return position, heading
+    
+    def get_curvature(self, distance: float) -> float:
+        """Get curvature at given distance for speed control"""
+        if self.is_closed:
+            distance = distance % self.total_distance
+        else:
+            distance = np.clip(distance, 0, self.total_distance)
+        
+        u_param = self.distance_to_u(distance)
+        
+        # Get first and second derivatives
+        first_deriv = splev(u_param, self.tck, der=1)
+        second_deriv = splev(u_param, self.tck, der=2)
+        
+        # Calculate curvature: |x'y'' - y'x''| / (x'^2 + y'^2)^(3/2)
+        dx, dy = first_deriv[0], first_deriv[1]
+        ddx, ddy = second_deriv[0], second_deriv[1]
+        
+        numerator = abs(dx * ddy - dy * ddx)
+        denominator = (dx**2 + dy**2)**(3/2)
+        
+        if denominator < 1e-8:
+            return 0.0
+        
+        return numerator / denominator
+
+
 class MotionController:
     """Controls vehicle motion along trajectories"""
     
@@ -198,43 +296,39 @@ class MotionController:
         self.scenario = scenario
         self.base_speed = base_speed
         
-        # Vehicle dynamics constraints
-        self.max_angular_velocity = 1.0  # rad/s - maximum yaw rate
-        self.max_angular_acceleration = 2.0  # rad/s^2 - maximum angular acceleration
-        
-        # Generate centerline based on scenario
+        # Create continuous trajectory based on scenario
         if scenario == MotionScenario.STRAIGHT_TRACK:
-            self.centerline = TrajectoryGenerator.generate_straight_track_centerline()
+            waypoints = TrajectoryGenerator.generate_straight_track_centerline()
+            self.trajectory = ContinuousTrajectory(waypoints, is_closed=False)
         else:
-            self.centerline = TrajectoryGenerator.generate_formula_student_centerline()
+            waypoints = TrajectoryGenerator.generate_formula_student_centerline()
+            self.trajectory = ContinuousTrajectory(waypoints, is_closed=True)
         
-        # Apply additional smoothing for both scenarios
-        # Use different smoothing factors based on scenario
-        if scenario == MotionScenario.STRAIGHT_TRACK:
-            self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline, smoothing_factor=0.05)
-        else:
-            # Apply light smoothing to already smoothed Formula Student track
-            self.centerline = TrajectoryGenerator.smooth_centerline(self.centerline, smoothing_factor=0.02)
+        # Initialize distance tracking
+        self.current_distance = 0.0
         
         # Initialize vehicle state based on scenario
         if scenario == MotionScenario.STRAIGHT_TRACK:
             # Scenario 1: Start at beginning of track
             initial_pos = np.array([0.0, 0.0, 0.0])
-            self.centerline_index = 0
+            self.current_distance = 0.0
         else:
-            # Scenario 2: Start at specific position
-            initial_pos = np.array([30.0, 12.5, 0.0])
-            # Find closest centerline point
+            # Scenario 2: Start at specific position (find closest distance)
+            target_pos = np.array([30.0, 12.5])
+            # Find closest point on trajectory
             min_dist = float('inf')
-            closest_idx = 0
-            for i, point in enumerate(self.centerline):
-                dist = np.sqrt((point[0] - initial_pos[0])**2 + (point[1] - initial_pos[1])**2)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_idx = i
-            self.centerline_index = closest_idx
-        
-        self.distance_along_segment = 0.0
+            best_distance = 0.0
+            
+            # Sample along trajectory to find closest point
+            for dist in np.linspace(0, self.trajectory.total_distance, 1000):
+                pos, _ = self.trajectory.get_position_and_heading(dist)
+                distance_to_target = np.linalg.norm(pos - target_pos)
+                if distance_to_target < min_dist:
+                    min_dist = distance_to_target
+                    best_distance = dist
+            
+            self.current_distance = best_distance
+            initial_pos = np.array([30.0, 12.5, 0.0])  # Keep original for consistency
         
         self.state = VehicleState(
             position=initial_pos,
@@ -246,11 +340,17 @@ class MotionController:
         
         # Previous values for derivative calculations
         self.prev_velocity = np.array([0.0, 0.0, 0.0])
-        self.prev_yaw = 0.0
     
     def get_centerline_points(self) -> List[Tuple[float, float]]:
         """Get centerline points for visualization"""
-        return self.centerline
+        # Sample the continuous trajectory for visualization
+        num_points = 400
+        points = []
+        for i in range(num_points):
+            distance = i * self.trajectory.total_distance / (num_points - 1)
+            pos, _ = self.trajectory.get_position_and_heading(distance)
+            points.append((pos[0], pos[1]))
+        return points
     
     def get_current_speed(self, elapsed_time: float) -> float:
         """
@@ -270,25 +370,19 @@ class MotionController:
                 return self.base_speed
         else:
             # Formula Student: Vary speed based on track curvature
-            # Calculate curvature from look-ahead point
-            look_ahead = self.get_look_ahead_point(5.0)  # 5 meters ahead
-            if look_ahead:
-                # Calculate curvature based on angle to look-ahead point
-                dx = look_ahead[0] - self.state.position[0]
-                dy = look_ahead[1] - self.state.position[1]
-                angle_to_target = np.arctan2(dy, dx)
-                angle_diff = abs(self._normalize_angle(angle_to_target - self.state.orientation[2]))
-                
-                # Reduce speed in curves (angle_diff > 0.3 rad ~ 17 degrees)
-                if angle_diff > 0.3:
-                    speed_factor = max(0.5, 1.0 - angle_diff / np.pi)
-                    return self.base_speed * speed_factor
+            # Get curvature at current position
+            curvature = self.trajectory.get_curvature(self.current_distance)
+            
+            # Reduce speed in high curvature areas
+            if curvature > 0.1:  # High curvature threshold
+                speed_factor = max(0.5, 1.0 - curvature / 0.5)
+                return self.base_speed * speed_factor
             
             return self.base_speed
     
     def update_motion(self, dt: float, elapsed_time: float) -> VehicleState:
         """
-        Update vehicle motion for one time step
+        Update vehicle motion for one time step using continuous trajectory
         
         Args:
             dt: Time step in seconds
@@ -300,76 +394,45 @@ class MotionController:
         # Get current speed
         speed = self.get_current_speed(elapsed_time)
         
-        # Calculate distance to move
+        # Update distance along trajectory
         distance_to_move = speed * dt
+        self.current_distance += distance_to_move
         
-        # Move along centerline
-        while distance_to_move > 0 and self.centerline_index < len(self.centerline) - 1:
-            # Current and next points
-            current_point = self.centerline[self.centerline_index]
-            next_point = self.centerline[self.centerline_index + 1]
+        # Handle trajectory wrapping for closed tracks
+        if self.scenario == MotionScenario.FORMULA_STUDENT:
+            self.current_distance = self.current_distance % self.trajectory.total_distance
+        else:
+            # For open tracks, clamp to trajectory bounds
+            self.current_distance = min(self.current_distance, self.trajectory.total_distance)
+        
+        # Get smooth position and heading from continuous trajectory
+        position, heading = self.trajectory.get_position_and_heading(self.current_distance)
+        
+        # Update vehicle state
+        self.state.position[0] = position[0]
+        self.state.position[1] = position[1]
+        self.state.orientation[2] = heading
+        
+        # Calculate velocities from heading (mathematically smooth)
+        self.state.linear_velocity[0] = speed * np.cos(heading)
+        self.state.linear_velocity[1] = speed * np.sin(heading)
+        
+        # Calculate angular velocity from heading derivative
+        if dt > 0:
+            # Get heading slightly ahead for derivative calculation
+            look_ahead_distance = min(0.1, self.trajectory.total_distance * 0.001)  # Small look-ahead
+            future_distance = self.current_distance + look_ahead_distance
             
-            # Vector to next point
-            dx = next_point[0] - current_point[0]
-            dy = next_point[1] - current_point[1]
-            segment_length = np.sqrt(dx**2 + dy**2)
-            
-            if segment_length < 1e-6:
-                # Skip zero-length segments
-                self.centerline_index += 1
-                continue
-            
-            # Remaining distance in current segment
-            remaining_in_segment = segment_length - self.distance_along_segment
-            
-            if distance_to_move <= remaining_in_segment:
-                # Move within current segment
-                self.distance_along_segment += distance_to_move
-                fraction = self.distance_along_segment / segment_length
-                
-                # Interpolate position
-                self.state.position[0] = current_point[0] + fraction * dx
-                self.state.position[1] = current_point[1] + fraction * dy
-                
-                # Calculate heading
-                new_yaw = np.arctan2(dy, dx)
-                self.state.orientation[2] = new_yaw
-                
-                # Calculate velocities
-                self.state.linear_velocity[0] = speed * np.cos(new_yaw)
-                self.state.linear_velocity[1] = speed * np.sin(new_yaw)
-                
-                # Calculate angular velocity (yaw rate) with limits
-                yaw_diff = self._normalize_angle(new_yaw - self.prev_yaw)
-                raw_angular_velocity = yaw_diff / dt if dt > 0 else 0.0
-                
-                # Apply angular velocity limit
-                if abs(raw_angular_velocity) > self.max_angular_velocity:
-                    raw_angular_velocity = np.sign(raw_angular_velocity) * self.max_angular_velocity
-                
-                # Apply angular acceleration limit
-                prev_angular_velocity = self.state.angular_velocity[2]
-                angular_acceleration = (raw_angular_velocity - prev_angular_velocity) / dt if dt > 0 else 0.0
-                
-                if abs(angular_acceleration) > self.max_angular_acceleration:
-                    # Limit acceleration
-                    angular_acceleration = np.sign(angular_acceleration) * self.max_angular_acceleration
-                    raw_angular_velocity = prev_angular_velocity + angular_acceleration * dt
-                
-                self.state.angular_velocity[2] = raw_angular_velocity
-                self.prev_yaw = new_yaw
-                
-                distance_to_move = 0
+            if self.scenario == MotionScenario.FORMULA_STUDENT:
+                future_distance = future_distance % self.trajectory.total_distance
             else:
-                # Move to next segment
-                distance_to_move -= remaining_in_segment
-                self.centerline_index += 1
-                self.distance_along_segment = 0.0
-                
-                # Wrap around for closed tracks
-                if self.scenario == MotionScenario.FORMULA_STUDENT:
-                    if self.centerline_index >= len(self.centerline) - 1:
-                        self.centerline_index = 0
+                future_distance = min(future_distance, self.trajectory.total_distance)
+            
+            _, future_heading = self.trajectory.get_position_and_heading(future_distance)
+            
+            # Calculate angular velocity from heading change
+            heading_diff = self._normalize_angle(future_heading - heading)
+            self.state.angular_velocity[2] = heading_diff / (look_ahead_distance / speed) if speed > 0 else 0.0
         
         # Calculate acceleration
         new_velocity = self.state.linear_velocity.copy()
@@ -381,7 +444,7 @@ class MotionController:
     
     def get_look_ahead_point(self, look_ahead_distance: float) -> Optional[Tuple[float, float]]:
         """
-        Get a point ahead on the centerline for trajectory following
+        Get a point ahead on the trajectory for trajectory following
         
         Args:
             look_ahead_distance: Distance to look ahead in meters
@@ -389,71 +452,46 @@ class MotionController:
         Returns:
             Look-ahead point or None if end of track
         """
-        # Start from current position
-        temp_index = self.centerline_index
-        temp_distance = self.distance_along_segment
-        remaining_distance = look_ahead_distance
+        # Calculate future distance along trajectory
+        future_distance = self.current_distance + look_ahead_distance
         
-        while remaining_distance > 0 and temp_index < len(self.centerline) - 1:
-            current_point = self.centerline[temp_index]
-            next_point = self.centerline[temp_index + 1]
-            
-            dx = next_point[0] - current_point[0]
-            dy = next_point[1] - current_point[1]
-            segment_length = np.sqrt(dx**2 + dy**2)
-            
-            if segment_length < 1e-6:
-                temp_index += 1
-                continue
-            
-            remaining_in_segment = segment_length - temp_distance
-            
-            if remaining_distance <= remaining_in_segment:
-                # Found look-ahead point
-                fraction = (temp_distance + remaining_distance) / segment_length
-                x = current_point[0] + fraction * dx
-                y = current_point[1] + fraction * dy
-                return (x, y)
-            else:
-                remaining_distance -= remaining_in_segment
-                temp_index += 1
-                temp_distance = 0.0
-        
-        # For closed tracks, wrap around
+        # Handle trajectory bounds based on scenario
         if self.scenario == MotionScenario.FORMULA_STUDENT:
-            temp_index = 0
-            while remaining_distance > 0 and temp_index < self.centerline_index:
-                current_point = self.centerline[temp_index]
-                next_point = self.centerline[temp_index + 1]
-                
-                dx = next_point[0] - current_point[0]
-                dy = next_point[1] - current_point[1]
-                segment_length = np.sqrt(dx**2 + dy**2)
-                
-                if segment_length < 1e-6:
-                    temp_index += 1
-                    continue
-                
-                if remaining_distance <= segment_length:
-                    fraction = remaining_distance / segment_length
-                    x = current_point[0] + fraction * dx
-                    y = current_point[1] + fraction * dy
-                    return (x, y)
-                else:
-                    remaining_distance -= segment_length
-                    temp_index += 1
+            # For closed tracks, wrap around
+            future_distance = future_distance % self.trajectory.total_distance
+        else:
+            # For open tracks, check if we're beyond the end
+            if future_distance > self.trajectory.total_distance:
+                return None
         
-        return None
+        # Get position at future distance
+        position, _ = self.trajectory.get_position_and_heading(future_distance)
+        return (position[0], position[1])
     
     def reset(self) -> None:
         """Reset motion controller to start position"""
-        self.centerline_index = 0
-        self.distance_along_segment = 0.0
+        # Reset distance tracking
+        self.current_distance = 0.0
         
         # Reset to initial position based on scenario
         if self.scenario == MotionScenario.STRAIGHT_TRACK:
             initial_pos = np.array([0.0, 0.0, 0.0])
+            self.current_distance = 0.0
         else:
+            # For Formula Student, start at specific position
+            target_pos = np.array([30.0, 12.5])
+            # Find closest point on trajectory
+            min_dist = float('inf')
+            best_distance = 0.0
+            
+            for dist in np.linspace(0, self.trajectory.total_distance, 1000):
+                pos, _ = self.trajectory.get_position_and_heading(dist)
+                distance_to_target = np.linalg.norm(pos - target_pos)
+                if distance_to_target < min_dist:
+                    min_dist = distance_to_target
+                    best_distance = dist
+            
+            self.current_distance = best_distance
             initial_pos = np.array([30.0, 12.5, 0.0])
         
         self.state = VehicleState(
@@ -465,7 +503,6 @@ class MotionController:
         )
         
         self.prev_velocity = np.array([0.0, 0.0, 0.0])
-        self.prev_yaw = 0.0
     
     @staticmethod
     def _normalize_angle(angle: float) -> float:
