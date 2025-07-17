@@ -69,9 +69,9 @@ def create_symforce_cone_factor(pose_key: int,
             # Transform landmark to robot frame
             landmark_robot = pose.transformTo(gtsam.Point2(landmark_pt[0], landmark_pt[1]))
             
-            # Compute position error
-            error_x = landmark_robot[0] - observation[0]
-            error_y = landmark_robot[1] - observation[1]
+            # Compute position error (observed - predicted)
+            error_x = observation[0] - landmark_robot[0]  # FIXED: Error sign was backwards!
+            error_y = observation[1] - landmark_robot[1]  # FIXED: Error sign was backwards!
             
             # Compute color error (0 if colors match, penalty otherwise)
             color_error = 0.0
@@ -93,11 +93,11 @@ def create_symforce_cone_factor(pose_key: int,
     ])
     noise_model = gtsam.noiseModel.Diagonal.Sigmas(noise_sigmas)
     
-    # Apply robust kernel for outlier rejection
-    noise_model = gtsam.noiseModel.Robust.Create(
-        gtsam.noiseModel.mEstimator.Huber.Create(1.0),
-        noise_model
-    )
+    # DISABLED: Robust kernels prevent observations from correcting poses!
+    # noise_model = gtsam.noiseModel.Robust.Create(
+    #     gtsam.noiseModel.mEstimator.Huber.Create(1.0),
+    #     noise_model
+    # )
     
     return gtsam.CustomFactor(noise_model, [pose_key, landmark_key], error_func)
 
@@ -132,28 +132,18 @@ def create_symforce_motion_factor(pose1_key: int,
             error_y = error_pose.y()
             error_theta = error_pose.theta()
             
-            # Simple Ackermann constraint - penalize lateral motion
-            # Approximate lateral velocity from consecutive poses
-            delta_pose = pose1.between(pose2)
-            forward_vel = delta_pose.x()
-            lateral_vel = delta_pose.y()
-            
-            # Lateral constraint error (should be near zero for Ackermann motion)
-            lateral_error = lateral_vel * 10.0
-            
-            # Return residual
-            return np.array([error_x, error_y, error_theta, lateral_error], dtype=np.float64)
+            # Return 3D residual only - remove lateral constraint that's causing dimension mismatch
+            return np.array([error_x, error_y, error_theta], dtype=np.float64)
             
         except Exception as e:
             print(f"Error in motion factor: {e}")
-            return np.zeros(4, dtype=np.float64)
+            return np.zeros(3, dtype=np.float64)
     
-    # Create noise model
+    # Create noise model - 3D for (x, y, theta)
     noise_sigmas = np.array([
         position_noise,      # x position
         position_noise,      # y position
-        rotation_noise,      # rotation
-        0.1                 # lateral constraint
+        rotation_noise       # rotation
     ])
     noise_model = gtsam.noiseModel.Diagonal.Sigmas(noise_sigmas)
     

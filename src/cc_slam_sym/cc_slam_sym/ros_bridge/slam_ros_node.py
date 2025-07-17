@@ -14,10 +14,10 @@ from custom_interface.msg import TrackedConeArray, TrackedCone
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped, Point
 from visualization_msgs.msg import MarkerArray, Marker
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-import tf2_ros
 from tf_transformations import quaternion_from_euler
+import tf2_ros
 
 # Standard imports
 import numpy as np
@@ -132,6 +132,11 @@ class SlamNode(Node):
         
     def _init_slam_components(self):
         """Initialize SLAM components"""
+        # Set up loggers for SLAM components
+        self.backend_logger = self.get_logger().get_child('backend')
+        self.frontend_logger = self.get_logger().get_child('frontend')
+        self.association_logger = self.get_logger().get_child('association')
+        
         # Frontend configuration
         frontend_config = FrontendConfig(
             keyframe_distance_threshold=self.get_parameter('frontend.keyframe_distance_threshold').value,
@@ -167,9 +172,9 @@ class SlamNode(Node):
             max_keyframes=self.get_parameter('backend.max_keyframes').value
         )
         
-        # Create SLAM components
-        self.frontend = SlamFrontend(frontend_config)
-        self.backend = SlamBackend(backend_config)
+        # Create SLAM components with loggers
+        self.frontend = SlamFrontend(frontend_config, self.frontend_logger)
+        self.backend = SlamBackend(backend_config, self.backend_logger)
         
         # Data converter
         self.converter = RosSlamConverter()
@@ -263,7 +268,7 @@ class SlamNode(Node):
                 
                 # Update frontend
                 pose = self.frontend.process_odometry(odom_data)
-                self.get_logger().debug(f"Updated pose: x={pose.x():.2f}, y={pose.y():.2f}, theta={pose.theta():.2f}")
+                self.get_logger().debug(f"[SLAM_ODOMETRY_UPDATE] pose=[{pose.x():.2f},{pose.y():.2f},{pose.theta():.2f}]")
                 
         except Exception as e:
             self.get_logger().error(f"Error processing odometry: {e}")
@@ -287,13 +292,15 @@ class SlamNode(Node):
                 )
                 
                 # Debug logging
-                self.get_logger().debug(f"Processed {len(observations)} observations, "
-                                       f"landmarks: {len(self.frontend.landmarks)}, "
-                                       f"candidates: {len(self.frontend.candidate_landmarks)}")
+                self.get_logger().debug(f"[SLAM_PROCESS_CONES] observations={len(observations)}, landmarks={len(self.frontend.landmarks)}, candidates={len(self.frontend.candidate_landmarks)}")
+                self.get_logger().debug(f"[SLAM_ASSOCIATION] matched_pairs={len(association_result.matched_pairs)}, unmatched_obs={len(association_result.unmatched_observations)}")
+                
+                # Store association result for later use
+                self.last_association_result = association_result
                 
                 # Check if new keyframe should be created
                 if self.frontend.should_create_keyframe(timestamp):
-                    keyframe = self.frontend.create_keyframe(timestamp, observations)
+                    keyframe = self.frontend.create_keyframe(timestamp, observations, association_result)
                     
                     if keyframe:
                         # Store keyframe
@@ -307,7 +314,7 @@ class SlamNode(Node):
                             self.get_logger().error(f"Keyframe {keyframe.id} has None pose!")
                             return
                         
-                        self.get_logger().info(f"Created keyframe {keyframe.id} at pose: x={keyframe.pose.x():.2f}, y={keyframe.pose.y():.2f}, theta={keyframe.pose.theta():.2f}")
+                        self.get_logger().info(f"[SLAM_KEYFRAME_CREATED] id={keyframe.id}, pose=[{keyframe.pose.x():.2f},{keyframe.pose.y():.2f},{keyframe.pose.theta():.2f}]")
                             
                         self.backend.keyframes[keyframe.id] = keyframe
                         
@@ -320,17 +327,32 @@ class SlamNode(Node):
                             if prev_keyframe and prev_keyframe.pose is not None:
                                 self.backend.add_odometry_factor(prev_keyframe, keyframe)
                         
-                        # Add landmark observations
-                        for obs in keyframe.observations:
-                            # Find corresponding landmark by track_id
-                            for lm_id, landmark in self.frontend.landmarks.items():
-                                if landmark.track_id == obs.track_id:
+                        # Add landmark observations using association result stored in keyframe
+                        if keyframe.association_result:
+                            # Get local landmarks used in association
+                            local_landmarks = self.frontend.local_map.get_nearby_landmarks()
+                            
+                            # Use matched pairs from association result
+                            num_added = 0
+                            for obs_idx, lm_idx in keyframe.association_result.matched_pairs:
+                                if obs_idx < len(keyframe.observations) and lm_idx < len(local_landmarks):
+                                    observation = keyframe.observations[obs_idx]
+                                    landmark = local_landmarks[lm_idx]
+                                    
                                     # Update backend's landmark list
-                                    self.backend.landmarks[lm_id] = landmark
+                                    self.backend.landmarks[landmark.id] = landmark
                                     
                                     # Add observation factor
-                                    self.backend.add_landmark_observation(keyframe, landmark, obs)
-                                    break
+                                    self.backend.add_landmark_observation(keyframe, landmark, observation)
+                                    num_added += 1
+                                    
+                                    self.get_logger().debug(f"[SLAM_ADD_OBSERVATION] keyframe={keyframe.id}, landmark={landmark.id}, obs_pos=[{observation.position[0]:.2f},{observation.position[1]:.2f}]")
+                                else:
+                                    self.get_logger().warning(f"[SLAM_ASSOCIATION_INDEX] Invalid indices: obs_idx={obs_idx}, lm_idx={lm_idx}, observations={len(keyframe.observations)}, landmarks={len(local_landmarks)}")
+                            
+                            self.get_logger().info(f"[SLAM_OBSERVATION_FACTORS] Added {num_added} observation factors for keyframe {keyframe.id}")
+                        else:
+                            self.get_logger().warning(f"[SLAM_NO_ASSOCIATION] No association result available for keyframe {keyframe.id}")
                         
                         # Check if optimization should run
                         # Track keyframes since last optimization
@@ -338,9 +360,16 @@ class SlamNode(Node):
                             self.keyframes_since_optimization = 0
                         self.keyframes_since_optimization += 1
                         
+                        # Debug: Show backend state before optimization check
+                        self.get_logger().debug(f"[SLAM_BACKEND_STATE] graph_size={self.backend.graph.size() if self.backend.graph else 0}, factors_since_opt={self.backend.factors_since_optimization}, keyframes_since_opt={self.keyframes_since_optimization}")
+                        
                         if self.keyframes_since_optimization >= self.backend.config.optimization_interval:
+                            self.get_logger().info(f"[SLAM_TRIGGER_OPTIMIZATION] keyframes={self.keyframes_since_optimization}")
                             self._perform_optimization()
                             self.keyframes_since_optimization = 0
+                            
+                            # Update frontend with optimized current pose
+                            self._update_frontend_with_optimized_poses()
                         
                         self.get_logger().debug(f"Backend now has {len(self.backend.keyframes)} keyframes")
                             
@@ -350,6 +379,7 @@ class SlamNode(Node):
     def _perform_optimization(self):
         """Run backend optimization"""
         try:
+            self.get_logger().info("[SLAM_OPTIMIZATION_START] Running backend optimization")
             start_time = time.time()
             success = self.backend.optimize()
             
@@ -357,13 +387,54 @@ class SlamNode(Node):
                 opt_time = time.time() - start_time
                 stats = self.backend.get_factor_graph_stats()
                 self.get_logger().info(
-                    f"Optimization complete in {opt_time*1000:.1f}ms, "
-                    f"factors: {stats['num_factors']}, values: {stats['num_values']}"
+                    f"[SLAM_OPTIMIZATION_DONE] time={opt_time*1000:.1f}ms, "
+                    f"factors={stats['num_factors']}, values={stats['num_values']}"
                 )
+                
+                # Check if we have optimized estimates
+                if self.backend.current_estimate is not None:
+                    self.get_logger().debug(f"[SLAM_BACKEND_VALUES] optimized_values={self.backend.current_estimate.size()}")
+                else:
+                    self.get_logger().error("[SLAM_OPTIMIZATION_ERROR] Backend current_estimate is None after optimization!")
+                    
                 self.last_optimization_time = time.time()
                 
+                # Reset data association tracking after successful optimization
+                self.frontend.data_association.reset_optimization_tracking()
+            else:
+                self.get_logger().error("[SLAM_OPTIMIZATION_ERROR] Optimization returned False!")
+                
         except Exception as e:
-            self.get_logger().error(f"Optimization error: {e}")
+            self.get_logger().error(f"[SLAM_OPTIMIZATION_ERROR] Exception: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+    
+    def _update_frontend_with_optimized_poses(self):
+        """Update frontend current pose with latest optimized estimate"""
+        try:
+            if not self.backend.current_estimate:
+                return
+                
+            # Get the most recent keyframe
+            if not self.backend.keyframes:
+                return
+                
+            latest_keyframe_id = max(self.backend.keyframes.keys())
+            latest_keyframe = self.backend.keyframes[latest_keyframe_id]
+            
+            # Get optimized pose for latest keyframe
+            if self.backend.current_estimate.exists(latest_keyframe.pose_symbol):
+                optimized_pose = self.backend.current_estimate.atPose2(latest_keyframe.pose_symbol)
+                
+                # Update frontend current pose
+                self.frontend.update_pose_from_backend(optimized_pose)
+                
+                self.get_logger().info(f"[SLAM_FRONTEND_UPDATE] pose=[{optimized_pose.x():.3f},{optimized_pose.y():.3f},{optimized_pose.theta():.3f}]")
+            else:
+                self.get_logger().warning(f"[SLAM_NO_OPTIMIZED_POSE] keyframe={latest_keyframe_id}")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error updating frontend with optimized poses: {e}")
             
     def _visualization_callback(self):
         """Publish visualization data"""
@@ -451,14 +522,19 @@ class SlamNode(Node):
                 try:
                     if self.backend.current_estimate.exists(kf.pose_symbol):
                         pose = self.backend.current_estimate.atPose2(kf.pose_symbol)
-                        self.get_logger().debug(f"Using optimized pose for keyframe {kf_id}")
+                        self.get_logger().debug(f"[SLAM_VIZ_POSE] keyframe={kf_id}, source=optimized")
+                    else:
+                        self.get_logger().debug(f"[SLAM_VIZ_MISSING] keyframe={kf_id}, symbol={kf.pose_symbol}")
                 except Exception as e:
                     self.get_logger().warn(f"Failed to get optimized pose for keyframe {kf_id}: {e}")
+            else:
+                if i == 0:  # Only log once to avoid spam
+                    self.get_logger().debug("Backend current_estimate is None")
                     
             # Fall back to initial pose from keyframe
             if pose is None and kf.pose is not None:
                 pose = kf.pose
-                self.get_logger().debug(f"Using initial pose for keyframe {kf_id}")
+                self.get_logger().debug(f"[SLAM_VIZ_POSE] keyframe={kf_id}, source=initial")
                 
             if pose is None:
                 self.get_logger().error(f"Keyframe {kf_id} has no pose (optimized or initial), kf.pose={kf.pose if hasattr(kf, 'pose') else 'no pose attr'}")

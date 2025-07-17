@@ -55,13 +55,15 @@ class BackendConfig:
 class SlamBackend:
     """SLAM Backend: constructs and optimizes factor graphs using GTSAM"""
     
-    def __init__(self, config: Optional[BackendConfig] = None):
+    def __init__(self, config: Optional[BackendConfig] = None, logger=None):
         """Initialize SLAM backend
         
         Args:
             config: Backend configuration
+            logger: Optional ROS logger for debug output
         """
         self.config = config or BackendConfig()
+        self.logger = logger  # For publishing optimization logs
         
         # GTSAM structures
         self.graph = gtsam.NonlinearFactorGraph()
@@ -126,9 +128,11 @@ class SlamBackend:
             noise
         )
         self.graph.add(prior_factor)
+        self.factors_since_optimization += 1  # Track prior factor
         
         # Add initial value
         self.initial_values.insert(keyframe.pose_symbol, keyframe.pose)
+        self.new_values_count += 1  # Track new value
         
     def add_odometry_factor(self, 
                            keyframe1: Keyframe, 
@@ -165,27 +169,37 @@ class SlamBackend:
             motion_scale = 1.0
             if linear_vel > max_linear_vel:
                 motion_scale *= (linear_vel / max_linear_vel)
-                print(f"Warning: High linear velocity {linear_vel:.2f} m/s")
+                if self.logger:
+                    self.logger.warning(f"[SLAM_HIGH_VELOCITY] linear={linear_vel:.2f}m/s")
             if angular_vel > max_angular_vel:
                 motion_scale *= (angular_vel / max_angular_vel)
-                print(f"Warning: High angular velocity {angular_vel:.2f} rad/s")
+                if self.logger:
+                    self.logger.warning(f"[SLAM_HIGH_ANGULAR_VELOCITY] angular={angular_vel:.2f}rad/s")
         else:
             motion_scale = 1.0
             
         # Create SymForce motion factor with Ackermann constraints
+        position_noise = self.config.odometry_position_noise * motion_scale
+        rotation_noise = self.config.odometry_rotation_noise * motion_scale
+        
+        if self.logger:
+            self.logger.debug(f"[SLAM_ADD_ODOMETRY] {keyframe1.pose_symbol}->{keyframe2.pose_symbol}, motion=[{relative_pose.x():.3f},{relative_pose.y():.3f},{relative_pose.theta():.3f}], pos_noise={position_noise:.3f}, rot_noise={rotation_noise:.3f}")
+        
         factor = create_symforce_motion_factor(
             keyframe1.pose_symbol,
             keyframe2.pose_symbol,
             relative_pose,
-            position_noise=self.config.odometry_position_noise * motion_scale,
-            rotation_noise=self.config.odometry_rotation_noise * motion_scale,
-            wheelbase=0.3  # Formula Student car wheelbase
+            position_noise=position_noise,
+            rotation_noise=rotation_noise,
+            wheelbase=1.3  # Formula Student car wheelbase
         )
         self.graph.add(factor)
+        self.factors_since_optimization += 1  # INCREMENT FOR ODOMETRY FACTORS TOO!
         
         # Add initial value for new keyframe
         if not self.initial_values.exists(keyframe2.pose_symbol):
             self.initial_values.insert(keyframe2.pose_symbol, keyframe2.pose)
+            self.new_values_count += 1  # Track new values too
             
     def add_landmark_observation(self,
                                keyframe: Keyframe,
@@ -203,13 +217,16 @@ class SlamBackend:
             total_votes = sum(landmark.color_votes.values())
             if total_votes > 0:
                 confidence = max(landmark.color_votes.values()) / total_votes
-                color_weight = 5.0 * confidence  # Scale weight by confidence
+                color_weight = 0.0  # Disable color penalty for perfect simulation
             else:
-                color_weight = 1.0
+                color_weight = 0.0
         else:
-            color_weight = 1.0
+            color_weight = 0.0
             
         # Create SymForce cone observation factor
+        if self.logger:
+            self.logger.debug(f"[SLAM_ADD_OBSERVATION] pose={keyframe.pose_symbol}, landmark={landmark.symbol}, obs_noise={self.config.landmark_observation_noise}, obs_pos={observation.position[:2].tolist()}")
+        
         factor = create_symforce_cone_factor(
             pose_key=keyframe.pose_symbol,
             landmark_key=landmark.symbol,
@@ -231,13 +248,24 @@ class SlamBackend:
         
         # Initialize landmark if first observation
         if not self.initial_values.exists(landmark.symbol):
-            # Transform observation to world frame using keyframe pose
+            # Transform observation to world frame using best available keyframe pose
+            keyframe_pose = None
+            
+            # Priority 1: Use optimized pose from current estimate if available
             if self.current_estimate and self.current_estimate.exists(keyframe.pose_symbol):
-                # Use current estimate of keyframe pose if available
                 keyframe_pose = self.current_estimate.atPose2(keyframe.pose_symbol)
-            else:
-                # Otherwise use the initial value
+                if self.logger:
+                    self.logger.debug(f"[SLAM_LANDMARK_INIT] Using optimized pose for landmark {landmark.symbol}")
+            
+            # Priority 2: Use initial keyframe pose as fallback
+            if keyframe_pose is None and keyframe.pose is not None:
                 keyframe_pose = keyframe.pose
+                if self.logger:
+                    self.logger.debug(f"[SLAM_LANDMARK_INIT] Using initial pose for landmark {landmark.symbol}")
+            
+            # Priority 3: Error if no pose available
+            if keyframe_pose is None:
+                raise ValueError(f"No pose available for landmark {landmark.symbol} initialization")
                 
             obs_robot = observation.position[:2]
             obs_world = keyframe_pose.transformFrom(obs_robot)
@@ -251,6 +279,9 @@ class SlamBackend:
             
             # Update landmark position estimate
             landmark.position = obs_world
+            
+            if self.logger:
+                self.logger.info(f"[SLAM_LANDMARK_CREATED] landmark={landmark.symbol}, world_pos=[{obs_world[0]:.3f},{obs_world[1]:.3f}], keyframe_pose=[{keyframe_pose.x():.3f},{keyframe_pose.y():.3f},{keyframe_pose.theta():.3f}], robot_obs=[{obs_robot[0]:.3f},{obs_robot[1]:.3f}]")
             
     def _landmark_error_func(self, pose: gtsam.Pose2, landmark: gtsam.Point2) -> np.ndarray:
         """Error function for landmark observation
@@ -293,7 +324,7 @@ class SlamBackend:
             relative_pose,
             position_noise=position_noise,
             rotation_noise=rotation_noise,
-            wheelbase=0.3  # Same as odometry
+            wheelbase=1.3  # Formula Student car wheelbase
         )
         self.graph.add(factor)
         
@@ -306,9 +337,14 @@ class SlamBackend:
         try:
             start_time = time.time()
             
-            # Skip optimization if not enough new factors
-            # Only require a minimal number to avoid empty optimizations
-            if self.factors_since_optimization < 2:
+            # Check if we have anything to optimize
+            if self.logger:
+                self.logger.debug(f"[SLAM_OPTIMIZATION_CHECK] factors_since_last={self.factors_since_optimization}, new_values={self.new_values_count}, graph_size={self.graph.size() if self.graph else 0}")
+            
+            # Skip optimization if no new factors
+            if self.factors_since_optimization == 0:
+                if self.logger:
+                    self.logger.debug("[SLAM_OPTIMIZATION_SKIP] No new factors to optimize")
                 return True
             
             # Use batch optimization instead of ISAM2 due to CustomFactor issues
@@ -337,22 +373,110 @@ class SlamBackend:
                     except:
                         pass
             
-            # Batch optimization
-            optimizer_params = gtsam.LevenbergMarquardtParams()
-            optimizer_params.setVerbosity("SILENT")
-            optimizer_params.setMaxIterations(100)
-            optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, combined_values, optimizer_params)
-            self.current_estimate = optimizer.optimize()
+            # Debug: Check initial error
+            initial_error = self.graph.error(combined_values)
+            if self.logger:
+                self.logger.debug(f"[SLAM_OPTIMIZATION_START] initial_error={initial_error:.6f}, graph_factors={self.graph.size()}, values={combined_values.size()}")
             
-            # Clear for next iteration
-            self.graph = gtsam.NonlinearFactorGraph()
+            # Count factor types and compute individual errors
+            odometry_factors = 0
+            observation_factors = 0
+            odometry_error = 0.0
+            observation_error = 0.0
+            
+            for i in range(self.graph.size()):
+                factor = self.graph.at(i)
+                if factor:
+                    try:
+                        factor_error = factor.error(combined_values)
+                        keys = factor.keys()
+                        if len(keys) == 2:
+                            key1_type = chr(gtsam.Symbol(keys[0]).chr())
+                            key2_type = chr(gtsam.Symbol(keys[1]).chr())
+                            
+                            if key1_type == 'x' and key2_type == 'x':
+                                odometry_factors += 1
+                                odometry_error += factor_error
+                            elif (key1_type == 'x' and key2_type == 'l') or (key1_type == 'l' and key2_type == 'x'):
+                                observation_factors += 1
+                                observation_error += factor_error
+                    except:
+                        pass
+            
+            if self.logger:
+                self.logger.debug(f"[SLAM_FACTOR_BREAKDOWN] odometry_factors={odometry_factors}, odometry_error={odometry_error:.6f}, observation_factors={observation_factors}, observation_error={observation_error:.6f}")
+            
+            # Batch optimization with verbose output
+            optimizer_params = gtsam.LevenbergMarquardtParams()
+            optimizer_params.setVerbosity("ERROR")  # Show optimization progress
+            optimizer_params.setMaxIterations(100)
+            optimizer_params.setRelativeErrorTol(1e-5)
+            optimizer_params.setAbsoluteErrorTol(1e-5)
+            
+            try:
+                optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, combined_values, optimizer_params)
+                self.current_estimate = optimizer.optimize()
+            except Exception as opt_error:
+                if self.logger:
+                    self.logger.error(f"[SLAM_OPTIMIZATION_ERROR] error_type={type(opt_error).__name__}, error_msg={str(opt_error)}, graph_size={self.graph.size()}, values_size={combined_values.size()}")
+                raise opt_error
+            
+            # Debug: Verify current_estimate is properly populated
+            if self.logger:
+                if self.current_estimate:
+                    self.logger.debug(f"[SLAM_OPTIMIZATION_SUCCESS] current_estimate_size={self.current_estimate.size()}")
+                else:
+                    self.logger.error("[SLAM_OPTIMIZATION_FAILED] current_estimate is None")
+            
+            # Debug: Check final error and changes
+            final_error = self.graph.error(self.current_estimate)
+            if self.logger:
+                self.logger.info(f"[SLAM_OPTIMIZATION_COMPLETE] initial_error={initial_error:.6f}, final_error={final_error:.6f}, error_reduction={initial_error - final_error:.6f}")
+            
+            # Check how much poses actually changed
+            pose_changes = []
+            for key in combined_values.keys():
+                if chr(gtsam.Symbol(key).chr()) == 'x':
+                    try:
+                        initial_pose = combined_values.atPose2(key)
+                        final_pose = self.current_estimate.atPose2(key)
+                        
+                        dx = final_pose.x() - initial_pose.x()
+                        dy = final_pose.y() - initial_pose.y()
+                        dtheta = final_pose.theta() - initial_pose.theta()
+                        
+                        change = np.sqrt(dx**2 + dy**2)
+                        pose_changes.append(change)
+                        
+                        if change > 0.01:  # Only log significant changes
+                            if self.logger:
+                                self.logger.debug(f"[SLAM_POSE_CORRECTION] {gtsam.Symbol(key).string()} moved {change:.3f}m (dx={dx:.3f}, dy={dy:.3f}, dtheta={dtheta:.3f})")
+                    except:
+                        pass
+            
+            if pose_changes:
+                if self.logger:
+                    self.logger.info(f"[SLAM_POSE_CHANGES] mean={np.mean(pose_changes):.3f}m, max={np.max(pose_changes):.3f}m, total_poses_moved={len([x for x in pose_changes if x > 0.01])}")
+            else:
+                if self.logger:
+                    self.logger.warning("[SLAM_NO_POSE_CHANGES] Optimization ran but no poses were corrected!")
+            
+            # Clear initial values after they've been used in optimization
             self.initial_values.clear()
+            
+            # Keep the graph for continuous optimization
+            # self.graph = gtsam.NonlinearFactorGraph()  # DON'T clear graph
+            
             self.factors_since_optimization = 0
             self.new_values_count = 0
-            self.factor_keys.clear()
+            # self.factor_keys.clear()  # Keep factor tracking for outlier removal
             
-            # Get current estimate
-            self.current_estimate = self.isam2.calculateEstimate()
+            # Keep the optimized estimate - DON'T overwrite with ISAM2
+            # self.current_estimate = self.isam2.calculateEstimate()  # This was discarding optimization results!
+            
+            # Verify current_estimate is still valid after cleanup
+            if self.logger:
+                self.logger.debug(f"[SLAM_CLEANUP] current_estimate_size={self.current_estimate.size() if self.current_estimate else 0}")
             
             # Remove outliers if enabled
             if self.config.remove_outliers:
@@ -362,7 +486,8 @@ class SlamBackend:
             self._update_landmark_estimates()
             
             # Log optimization result
-            print(f"Optimization complete. Current estimate has {self.current_estimate.size()} values")
+            if self.logger:
+                self.logger.debug(f"[SLAM_OPTIMIZATION_VALUES] estimate_size={self.current_estimate.size()}")
             
             # Update statistics
             elapsed_time = time.time() - start_time
@@ -383,11 +508,16 @@ class SlamBackend:
             # Apply sliding window if needed
             if self.config.use_sliding_window:
                 self.marginalize_old_keyframes(self.config.max_keyframes)
+                
+                # Rebuild factor graph with only recent keyframes and landmarks
+                if len(self.keyframes) >= self.config.max_keyframes:
+                    self._rebuild_factor_graph_for_sliding_window()
             
             return True
             
         except Exception as e:
-            print(f"Optimization failed: {e}")
+            if self.logger:
+                self.logger.error(f"[SLAM_OPTIMIZATION_FAILED] error={e}")
             return False
             
     def _update_landmark_estimates(self):
@@ -397,9 +527,12 @@ class SlamBackend:
             
         # Get marginals for covariance computation
         try:
-            marginals = gtsam.Marginals(self.isam2.getFactorsUnsafe(), self.current_estimate)
-        except:
+            # Use the factor graph directly since we're using batch optimization
+            marginals = gtsam.Marginals(self.graph, self.current_estimate)
+        except Exception as e:
             # If marginals computation fails, skip covariance update
+            if self.logger:
+                self.logger.warning(f"[SLAM_MARGINALS_ERROR] Failed to compute marginals: {e}")
             return
             
         # Update each landmark
@@ -452,19 +585,148 @@ class SlamBackend:
         Args:
             keep_last_n: Number of recent keyframes to keep
         """
-        if len(self.optimized_keyframes) <= keep_last_n:
+        if len(self.keyframes) <= keep_last_n:
             return
             
         # Get keyframes to marginalize
-        num_to_marginalize = len(self.optimized_keyframes) - keep_last_n
-        keyframes_to_marginalize = self.optimized_keyframes[:num_to_marginalize]
+        keyframe_ids = sorted(self.keyframes.keys())
+        num_to_marginalize = len(keyframe_ids) - keep_last_n
+        keyframes_to_marginalize = keyframe_ids[:num_to_marginalize]
         
-        # In ISAM2, we can use fixed lag smoother approach
-        # For now, just track which keyframes are active
-        self.optimized_keyframes = self.optimized_keyframes[num_to_marginalize:]
+        # Remove old keyframes from storage
+        for kf_id in keyframes_to_marginalize:
+            if kf_id in self.keyframes:
+                del self.keyframes[kf_id]
         
-        # Log marginalization
-        print(f"Marginalized {num_to_marginalize} old keyframes")
+        # Also remove old landmarks that are no longer observed
+        # (This is a simplified approach - in full SLAM you'd properly marginalize)
+        if len(keyframes_to_marginalize) > 0:
+            # Get remaining keyframe IDs
+            remaining_keyframes = set(self.keyframes.keys())
+            landmarks_to_remove = []
+            
+            for lm_id, landmark in self.landmarks.items():
+                # Check if landmark is still observed by remaining keyframes
+                still_observed = False
+                for kf_id in remaining_keyframes:
+                    keyframe = self.keyframes[kf_id]
+                    for obs in keyframe.observations:
+                        if obs.track_id == landmark.track_id:
+                            still_observed = True
+                            break
+                    if still_observed:
+                        break
+                
+                if not still_observed:
+                    landmarks_to_remove.append(lm_id)
+            
+            # Remove unobserved landmarks
+            for lm_id in landmarks_to_remove:
+                del self.landmarks[lm_id]
+                
+            if self.logger:
+                self.logger.info(f"[SLAM_MARGINALIZED] keyframes={num_to_marginalize}, landmarks={len(landmarks_to_remove)}")
+        
+        # Update optimized keyframes list
+        self.optimized_keyframes = [kf_id for kf_id in self.optimized_keyframes 
+                                   if kf_id in self.keyframes]
+    
+    def _rebuild_factor_graph_for_sliding_window(self):
+        """Rebuild factor graph with only recent keyframes and landmarks for sliding window"""
+        if self.logger:
+            self.logger.debug("[SLAM_REBUILD_GRAPH] Rebuilding factor graph for sliding window")
+        
+        # Create new factor graph
+        new_graph = gtsam.NonlinearFactorGraph()
+        new_initial_values = gtsam.Values()
+        
+        # Sort keyframes by ID
+        keyframe_ids = sorted(self.keyframes.keys())
+        
+        # Add prior for the oldest remaining keyframe
+        if keyframe_ids:
+            first_kf = self.keyframes[keyframe_ids[0]]
+            
+            # Use optimized pose if available, otherwise initial pose
+            if self.current_estimate and self.current_estimate.exists(first_kf.pose_symbol):
+                pose = self.current_estimate.atPose2(first_kf.pose_symbol)
+            else:
+                pose = first_kf.pose
+            
+            # Add prior factor
+            noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([
+                self.config.prior_position_noise,
+                self.config.prior_position_noise,
+                self.config.prior_rotation_noise
+            ]))
+            prior_factor = gtsam.PriorFactorPose2(first_kf.pose_symbol, pose, noise)
+            new_graph.add(prior_factor)
+            new_initial_values.insert(first_kf.pose_symbol, pose)
+        
+        # Add odometry factors between consecutive keyframes
+        for i in range(len(keyframe_ids) - 1):
+            kf1 = self.keyframes[keyframe_ids[i]]
+            kf2 = self.keyframes[keyframe_ids[i + 1]]
+            
+            # Get poses
+            pose1 = self.current_estimate.atPose2(kf1.pose_symbol) if self.current_estimate and self.current_estimate.exists(kf1.pose_symbol) else kf1.pose
+            pose2 = self.current_estimate.atPose2(kf2.pose_symbol) if self.current_estimate and self.current_estimate.exists(kf2.pose_symbol) else kf2.pose
+            
+            # Calculate relative pose
+            relative_pose = pose1.between(pose2)
+            
+            # Add motion factor
+            from .symforce_gtsam_factors_stable import create_symforce_motion_factor
+            factor = create_symforce_motion_factor(
+                kf1.pose_symbol,
+                kf2.pose_symbol,
+                relative_pose,
+                position_noise=self.config.odometry_position_noise,
+                rotation_noise=self.config.odometry_rotation_noise,
+                wheelbase=1.3  # Formula Student car wheelbase
+            )
+            new_graph.add(factor)
+            
+            # Add pose to initial values
+            if not new_initial_values.exists(kf2.pose_symbol):
+                new_initial_values.insert(kf2.pose_symbol, pose2)
+        
+        # Add landmark observation factors
+        for lm_id, landmark in self.landmarks.items():
+            # Get optimized or initial landmark position
+            if self.current_estimate and self.current_estimate.exists(landmark.symbol):
+                lm_pos = self.current_estimate.atPoint2(landmark.symbol)
+                new_initial_values.insert(landmark.symbol, lm_pos)
+            else:
+                lm_pos = gtsam.Point2(landmark.position[0], landmark.position[1])
+                new_initial_values.insert(landmark.symbol, lm_pos)
+            
+            # Add observation factors for this landmark
+            for kf_id in keyframe_ids:
+                keyframe = self.keyframes[kf_id]
+                for obs in keyframe.observations:
+                    if obs.track_id == landmark.track_id:
+                        # Add observation factor
+                        from .symforce_gtsam_factors_stable import create_symforce_cone_factor
+                        factor = create_symforce_cone_factor(
+                            pose_key=keyframe.pose_symbol,
+                            landmark_key=landmark.symbol,
+                            observation=obs.position[:2],
+                            obs_color=obs.color,
+                            landmark_color=landmark.color,
+                            position_noise=self.config.landmark_observation_noise,
+                            color_weight=0.0,  # Disabled for perfect simulation
+                            use_bearing_range=False
+                        )
+                        new_graph.add(factor)
+        
+        # Replace the old graph and initial values
+        self.graph = new_graph
+        self.initial_values = new_initial_values
+        self.factor_keys = []  # Reset factor tracking
+        
+        if self.logger:
+            self.logger.debug(f"[SLAM_GRAPH_REBUILT] factors={new_graph.size()}, variables={new_initial_values.size()}")
         
     def get_factor_graph_stats(self) -> Dict:
         """Get statistics about the factor graph
@@ -604,10 +866,12 @@ class SlamBackend:
                 
                 # Update statistics
                 self.optimization_stats["outliers_removed"] += len(factors_to_remove)
-                print(f"Removed {len(factors_to_remove)} outlier factors")
+                if self.logger:
+                    self.logger.info(f"[SLAM_OUTLIERS_REMOVED] count={len(factors_to_remove)}")
                 
         except Exception as e:
-            print(f"Outlier removal failed: {e}")
+            if self.logger:
+                self.logger.error(f"[SLAM_OUTLIER_REMOVAL_FAILED] error={e}")
     
     def reset(self):
         """Reset the backend to initial state"""

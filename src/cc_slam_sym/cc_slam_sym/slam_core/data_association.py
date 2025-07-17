@@ -9,6 +9,7 @@ from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 from scipy.spatial import KDTree
 import gtsam
+import time
 
 from ..utils.data_structures import ConeCluster, Landmark, ConeColor, LandmarkType
 
@@ -28,19 +29,31 @@ class AssociationConfig:
     color_match_required: bool = True     # Require color match for association
     use_mahalanobis: bool = True         # Use Mahalanobis distance
     min_observations_for_landmark: int = 2  # Min observations before creating landmark
+    base_chi2_threshold: float = 0.90        # Base chi-squared confidence level
+    loop_closure_threshold_scale: float = 2.0 # Scale factor for loop closure scenarios
+    min_landmarks_for_loop_closure: int = 3  # Min landmarks to consider loop closure
     
 
 class DataAssociation:
     """Nearest neighbor data association for cone matching"""
     
-    def __init__(self, config: Optional[AssociationConfig] = None):
+    def __init__(self, config: Optional[AssociationConfig] = None, logger=None):
         """Initialize data association module
         
         Args:
             config: Configuration parameters
+            logger: Optional ROS logger for debug output
         """
         self.config = config or AssociationConfig()
         self._observation_counts: Dict[int, int] = {}  # Track observation counts
+        self.logger = logger  # For logging debug output
+        
+        # Track association history for loop closure detection
+        self.landmark_creation_times = {}  # landmark_id -> timestamp
+        self.landmark_creation_poses = {}  # landmark_id -> robot_pose
+        self.last_optimization_time = time.time()
+        self.distance_traveled = 0.0
+        self.last_pose = None
         
     def associate(self, 
                   observations: List[ConeCluster], 
@@ -73,9 +86,21 @@ class DataAssociation:
                 unmatched_landmarks=[]
             )
             
-        # Chi-squared threshold for 2-DOF at 95% confidence
+        # Detect potential loop closure based on landmark age
+        is_potential_loop_closure = self._detect_loop_closure(landmarks, robot_pose)
+        
+        # Chi-squared threshold for 2-DOF - adaptive based on loop closure
         from scipy.stats import chi2
-        chi2_threshold = chi2.ppf(0.95, df=2)  # ~5.991
+        base_threshold = chi2.ppf(self.config.base_chi2_threshold, df=2)
+        
+        if is_potential_loop_closure:
+            chi2_threshold = base_threshold * self.config.loop_closure_threshold_scale
+            if self.logger:
+                self.logger.info(f"[SLAM_LOOP_CLOSURE] ACTIVATED - threshold={chi2_threshold:.3f} (base={base_threshold:.3f})")
+        else:
+            chi2_threshold = base_threshold
+            if self.logger:
+                self.logger.debug(f"[SLAM_ASSOCIATION] Using standard chi-squared threshold: {chi2_threshold:.3f}")
         
         # Track which landmarks have been matched
         matched_landmark_set = set()
@@ -86,6 +111,8 @@ class DataAssociation:
         if self.config.use_mahalanobis and robot_pose is not None:
             # Use predicted pose if available for better matching
             pose_for_association = predicted_pose if predicted_pose is not None else robot_pose
+            if self.logger:
+                self.logger.debug(f"[SLAM_ASSOCIATION_START] observations={len(observations)}, landmarks={len(landmarks)}, pose=[{pose_for_association.x():.3f},{pose_for_association.y():.3f},{pose_for_association.theta():.3f}]")
             
             # Extract positions for KD-tree (for efficient candidate search)
             lm_positions = np.array([[lm.position[0], lm.position[1]] 
@@ -138,17 +165,52 @@ class DataAssociation:
                         # Singular matrix, skip this association
                         continue
                     
+                    # Enhanced debug logging
+                    euclidean_dist = np.linalg.norm(innovation)
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_ASSOCIATION_CANDIDATE] obs_{obs_idx}->lm_{lm_idx}: euclidean={euclidean_dist:.3f}m, mahalanobis²={mahalanobis_dist_sq:.3f}, threshold={chi2_threshold:.3f}, colors={observation.color}/{landmark.color}")
+                    
+                    # Debug data for logging
+                    log_data = {
+                        'obs_idx': obs_idx,
+                        'lm_id': landmark.id,
+                        'lm_idx': lm_idx,
+                        'euclidean_dist': euclidean_dist,
+                        'mahalanobis_dist_sq': float(mahalanobis_dist_sq),
+                        'threshold': float(chi2_threshold),
+                        'is_loop_closure': is_potential_loop_closure
+                    }
+                    
                     # Check if within statistical threshold and better than current best
                     if (mahalanobis_dist_sq < chi2_threshold and 
                         mahalanobis_dist_sq < min_mahalanobis_dist_sq):
                         min_mahalanobis_dist_sq = mahalanobis_dist_sq
                         best_match = lm_idx
+                        if self.logger:
+                            self.logger.debug(f"[SLAM_ASSOCIATION_CANDIDATE] obs_{obs_idx}->lm_{lm_idx}: BEST candidate so far")
+                        # Mark as candidate
+                    else:
+                        if mahalanobis_dist_sq >= chi2_threshold:
+                            if self.logger:
+                                self.logger.debug(f"[SLAM_ASSOCIATION_REJECTED] obs_{obs_idx}->lm_{lm_idx}: exceeds threshold")
+                            # Rejected due to threshold
+                        else:
+                            if self.logger:
+                                self.logger.debug(f"[SLAM_ASSOCIATION_REJECTED] obs_{obs_idx}->lm_{lm_idx}: not best match")
+                            # Rejected as not best match
+                    # Log data handled above with logger
                 
                 if best_match is not None:
                     matched_pairs.append((obs_idx, best_match))
                     matched_landmark_set.add(best_match)
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_ASSOCIATION_SUCCESS] obs_{obs_idx}->lm_{best_match}, "
+                          f"Mahalanobis²={min_mahalanobis_dist_sq:.3f}")
+                    # Success logged above
                 else:
                     unmatched_observations.append(obs_idx)
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_ASSOCIATION_FAILED] obs_{obs_idx}: no valid associations")
                     
         else:
             # Fall back to simple Euclidean distance matching
@@ -203,6 +265,84 @@ class DataAssociation:
             unmatched_observations=unmatched_observations,
             unmatched_landmarks=unmatched_landmarks
         )
+    
+    def _detect_loop_closure(self, landmarks: List[Landmark], robot_pose: gtsam.Pose2) -> bool:
+        """Detect if we're potentially in a loop closure scenario
+        
+        Loop closure is likely if:
+        1. We see multiple old landmarks (created > 10s ago)
+        2. These landmarks were created when robot was far away
+        3. We've traveled a significant distance since last optimization
+        
+        Args:
+            landmarks: Current visible landmarks
+            robot_pose: Current robot pose
+            
+        Returns:
+            True if loop closure is likely
+        """
+        if not landmarks or not robot_pose:
+            return False
+            
+        current_time = time.time()
+        old_landmark_count = 0
+        
+        # Update distance traveled
+        if self.last_pose is not None:
+            delta_pose = self.last_pose.between(robot_pose)
+            self.distance_traveled += np.sqrt(delta_pose.x()**2 + delta_pose.y()**2)
+        self.last_pose = robot_pose
+        
+        # Check each landmark
+        for landmark in landmarks:
+            creation_time = self.landmark_creation_times.get(landmark.id, current_time)
+            time_since_creation = current_time - creation_time
+            
+            # Old landmark (seen more than 10 seconds ago)
+            if time_since_creation > 10.0:
+                old_landmark_count += 1
+                
+                # Check distance from creation pose
+                if landmark.id in self.landmark_creation_poses:
+                    creation_pose = self.landmark_creation_poses[landmark.id]
+                    distance_from_creation = np.sqrt(
+                        (robot_pose.x() - creation_pose.x())**2 + 
+                        (robot_pose.y() - creation_pose.y())**2
+                    )
+                    
+                    if distance_from_creation > 20.0:  # Traveled far since creation
+                        if self.logger:
+                            self.logger.debug(f"[SLAM_OLD_LANDMARK] lm_{landmark.id}: created {time_since_creation:.1f}s ago, "
+                              f"{distance_from_creation:.1f}m away")
+        
+        # Determine if loop closure
+        is_loop_closure = (old_landmark_count >= self.config.min_landmarks_for_loop_closure or
+                          self.distance_traveled > 50.0)
+        
+        if is_loop_closure:
+            if self.logger:
+                self.logger.info(f"[SLAM_LOOP_CLOSURE_DETECTED] old_landmarks={old_landmark_count}, "
+                  f"traveled {self.distance_traveled:.1f}m")
+            
+            # Loop closure event logged above
+            
+        return is_loop_closure
+    
+    def update_landmark_tracking(self, landmark_id: int, timestamp: float, robot_pose: gtsam.Pose2):
+        """Update tracking information when a new landmark is created
+        
+        Args:
+            landmark_id: ID of the newly created landmark
+            timestamp: Creation timestamp
+            robot_pose: Robot pose at creation time
+        """
+        self.landmark_creation_times[landmark_id] = timestamp
+        self.landmark_creation_poses[landmark_id] = robot_pose
+        
+    def reset_optimization_tracking(self):
+        """Reset tracking after optimization"""
+        self.last_optimization_time = time.time()
+        self.distance_traveled = 0.0
         
     def compute_mahalanobis_distance(self,
                                    obs_position: np.ndarray,

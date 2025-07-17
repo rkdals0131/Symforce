@@ -42,14 +42,18 @@ class FrontendConfig:
 class SlamFrontend:
     """SLAM Frontend: processes sensor data and prepares it for the backend"""
     
-    def __init__(self, config: Optional[FrontendConfig] = None):
+    def __init__(self, config: Optional[FrontendConfig] = None, logger=None):
         """Initialize SLAM frontend
         
         Args:
             config: Frontend configuration
+            logger: Optional ROS logger for debug output
         """
         self.config = config or FrontendConfig()
-        self.data_association = DataAssociation(self.config.association_config)
+        self.logger = logger
+        
+        # Pass logger to data association
+        self.data_association = DataAssociation(self.config.association_config, logger)
         
         # State tracking
         self.current_pose = gtsam.Pose2(0.0, 0.0, 0.0)
@@ -124,6 +128,26 @@ class SlamFrontend:
         self.local_map.update_current_pose(self.current_pose, odom_data.timestamp)
             
         return self.current_pose
+    
+    def update_pose_from_backend(self, optimized_pose: gtsam.Pose2):
+        """Update current pose with optimized estimate from backend
+        
+        Args:
+            optimized_pose: Optimized pose from SLAM backend
+        """
+        print(f"Frontend: Updating pose from backend optimization")
+        print(f"  Before: x={self.current_pose.x():.3f}, y={self.current_pose.y():.3f}, theta={self.current_pose.theta():.3f}")
+        print(f"  After:  x={optimized_pose.x():.3f}, y={optimized_pose.y():.3f}, theta={optimized_pose.theta():.3f}")
+        
+        # Update current pose with optimized estimate
+        self.current_pose = optimized_pose
+        
+        # Update last keyframe pose if it exists
+        if self.keyframes:
+            latest_keyframe = self.keyframes[-1]
+            if latest_keyframe.pose_symbol:
+                # Don't update keyframe pose - it will be handled by backend
+                pass
         
     def should_create_keyframe(self, current_time: float) -> bool:
         """Check if a new keyframe should be created
@@ -154,12 +178,14 @@ class SlamFrontend:
         
     def create_keyframe(self, 
                        timestamp: float,
-                       observations: List[ConeCluster]) -> Optional[Keyframe]:
+                       observations: List[ConeCluster],
+                       association_result: Optional[AssociationResult] = None) -> Optional[Keyframe]:
         """Create a new keyframe
         
         Args:
             timestamp: Keyframe timestamp
             observations: Cone observations at this keyframe
+            association_result: Optional association result for this keyframe
             
         Returns:
             Created keyframe or None if creation failed
@@ -174,7 +200,8 @@ class SlamFrontend:
             timestamp=timestamp,
             pose_symbol=gtsam.symbol('x', self.next_keyframe_id),
             pose=self.current_pose,
-            observations=observations
+            observations=observations,
+            association_result=association_result  # Store association result
         )
         
         # Verify keyframe pose
@@ -346,13 +373,28 @@ class SlamFrontend:
         # Add to local map
         self.local_map.add_landmark(landmark)
         
+        # Update data association tracking for loop closure detection
+        self.data_association.update_landmark_tracking(
+            landmark.id, 
+            timestamp, 
+            self.current_pose
+        )
+        
         # Clear candidates
         del self.candidate_landmarks[track_id]
         
-        # Debug logging (if logger available)
-        import logging
-        logger = logging.getLogger("frontend")
-        logger.info(f"Created landmark {landmark.id} with track_id={track_id} at position ({avg_position[0]:.2f}, {avg_position[1]:.2f}), color={color}")
+        # Log landmark creation
+        if self.logger:
+            self.logger.info(f"[SLAM_LANDMARK_CREATED] id={landmark.id}, track_id={track_id}, position=[{avg_position[0]:.2f},{avg_position[1]:.2f}], color={color}, observations={len(candidates)}")
+        
+        # Check for nearby landmarks (potential duplicates)
+        nearby_landmarks = self.local_map.get_nearby_landmarks(position=avg_position, radius=2.0)
+        for nearby_lm in nearby_landmarks:
+            if nearby_lm.id != landmark.id and nearby_lm.color == color:
+                dist = np.linalg.norm(nearby_lm.position - avg_position)
+                if dist < 1.0 and self.logger:
+                    self.logger.warning(f"[SLAM_DUPLICATE_WARNING] New landmark {landmark.id} created {dist:.3f}m from existing landmark {nearby_lm.id} (color={color})")
+        
         
     def get_odometry_noise_model(self) -> gtsam.noiseModel.Diagonal:
         """Get noise model for odometry factors

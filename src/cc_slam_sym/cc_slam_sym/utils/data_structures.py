@@ -229,6 +229,9 @@ class Keyframe:
     connected_keyframes: List[int] = field(default_factory=list)
     observed_landmarks: List[int] = field(default_factory=list)
     
+    # Association result for this keyframe
+    association_result: Optional['AssociationResult'] = None
+    
     def should_be_keyframe(self, last_kf: 'Keyframe', 
                           trans_threshold: float = 1.0, 
                           rot_threshold: float = 0.2) -> bool:

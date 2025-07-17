@@ -27,6 +27,9 @@ setup(
             'dummy_publisher = cc_slam_sym.simulation.dummy_publisher_node:main',
             'slam_node = cc_slam_sym.ros_bridge.slam_ros_node:main',
             'slam_debug_monitor = cc_slam_sym.utils.slam_debug_monitor:main',
+            'association_monitor = cc_slam_sym.debug.association_monitor_node:main',
+            'optimization_monitor = cc_slam_sym.debug.optimization_monitor_node:main',
+            'landmark_monitor = cc_slam_sym.debug.landmark_monitor_node:main',
         ],
     },
 )

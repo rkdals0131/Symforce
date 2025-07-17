@@ -17,9 +17,9 @@
     # Frontend Configuration
     frontend:
       # Keyframe Selection
-      keyframe_distance_threshold: 2.0    # meters
-      keyframe_rotation_threshold: 0.3    # radians (~17 degrees)
-      keyframe_time_threshold: 1.0        # seconds
+      keyframe_distance_threshold: 1.0    # meters (reduced from 2.0 for less info loss)
+      keyframe_rotation_threshold: 0.2    # radians (~11 degrees, reduced from 0.3)
+      keyframe_time_threshold: 0.3        # seconds (reduced from 1.0 for better temporal resolution)
       
       # Data Association
       max_association_distance: 1.5       # meters
@@ -31,38 +31,38 @@
       # Noise Models
       # IMPORTANT: These should match the actual sensor noise!
       # With simulated perfect odometry (noise=0), use very small values
-      odometry_position_noise: 0.001      # meters (nearly perfect)
-      odometry_rotation_noise: 0.001      # radians (nearly perfect)
-      landmark_position_noise: 0.2        # meters (keep realistic for cones)
-      use_odometry_covariance: false      # If true, use covariance from odometry messages
+      odometry_position_noise: 0.02       # meters (perfect simulation)
+      odometry_rotation_noise: 0.02       # radians (perfect simulation)
+      landmark_position_noise: 0.02       # meters (perfect simulation)
+      use_odometry_covariance: true      # If true, use covariance from odometry messages
     
     # Backend Configuration
     backend:
       # Optimization Settings
-      optimization_interval: 5            # Optimize every N keyframes
+      optimization_interval: 10           # Optimize every N keyframes (increased due to denser keyframes)
       max_iterations: 100                 # Maximum optimizer iterations
       relinearize_threshold: 0.1          # ISAM2 relinearization threshold
       relinearize_skip: 10                # ISAM2 relinearization skip
       
       # Noise Models
       # IMPORTANT: Match actual sensor characteristics!
-      prior_position_noise: 0.001         # meters (we know starting position well)
-      prior_rotation_noise: 0.001         # radians (we know starting orientation)
-      odometry_position_noise: 0.001      # meters (perfect simulated odometry)
-      odometry_rotation_noise: 0.001      # radians (perfect simulated odometry)
-      landmark_observation_noise: 0.3     # meters (keep realistic for cone detection)
+      prior_position_noise: 1e-6          # meters (perfect simulation)
+      prior_rotation_noise: 1e-6          # radians (perfect simulation)
+      odometry_position_noise: 0.5        # meters (HIGHER noise - let observations correct odometry)
+      odometry_rotation_noise: 0.2        # radians (HIGHER noise - let observations correct odometry)
+      landmark_observation_noise: 0.05    # meters (LOWER noise - trust observations more)
       
       # Robust Kernels
-      use_robust_kernels: true
+      use_robust_kernels: false           # Disable for perfect simulation
       huber_parameter: 1.0                # Huber robust kernel parameter
       
       # Outlier Rejection
       chi2_threshold: 9.0                 # Chi-squared threshold for 2 DOF at 99% confidence
-      remove_outliers: true               # Enable automatic outlier removal
+      remove_outliers: false              # Disable for perfect simulation
       
       # Sliding Window
       use_sliding_window: true
-      max_keyframes: 50                   # Maximum keyframes to keep
+      max_keyframes: 15                   # Maximum keyframes to keep (15m coverage with 1m spacing)
       
       # Loop Closure (future feature)
       enable_loop_closure: false
