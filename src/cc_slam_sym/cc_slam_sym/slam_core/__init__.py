@@ -48,3 +48,9 @@ try:
 except (ImportError, AttributeError):
     # SymForce may not be available or configured
     pass
+
+# Import cone pattern factor for structural constraints
+try:
+    from .cone_pattern_factor import ConePatternDetector, ConePattern, PatternType, ConePatternFactor
+except ImportError:
+    pass

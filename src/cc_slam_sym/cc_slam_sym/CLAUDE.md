@@ -101,12 +101,93 @@ ros2 launch cc_slam_sym slam_launch.py
 - Must handle 10Hz backend processing rate
 - Requires optimized Jacobian computation via SymForce
 - Need proper sliding window management
-- **Current Priority**: Verify optimization now works with recent fixes
+- **Current Priority**: Verify rigid constraints are enforced
+
+## Critical Fixes Applied (2025-07-17)
+
+### Rigid Constraint Enforcement
+- Observation factors now correctly transform landmarks to robot frame
+- Very tight noise model (0.1x) enforces rigid relative positions
+- Simplified motion model for reliability
+- Enhanced debugging to track constraint violations
+
+### Expected Behavior
+- Landmarks should maintain exact relative position to observing poses
+- Optimization should trigger every 10 keyframes
+- No "[LARGE_ERROR]" messages should appear
+- System should converge to consistent map
 
 ## System Architecture Notes
 - This is a **cone-based visual SLAM**, NOT LiDAR SLAM
 - Tracks colored cones (yellow/blue/red) for Formula Student
-- Input: 100Hz odometry + 20Hz cone observations
+- Input: 100Hz odometry + 20Hz cone observations + 8Hz GPS (RTK)
 - Keyframe creation: Every 1m/0.2rad/0.3s (optimized for less information loss)
 - Optimization: Every 10 keyframes with 15-keyframe sliding window
 - Reduced information condensation from 16:1 to 8:1 at low speeds
+
+## Corner Divergence Fix (2025-07-18)
+
+### Adaptive Motion-Aware Data Association
+- Chi-squared thresholds now scale with angular velocity
+- Association search radius increases during turns
+- Outlier rejection adapts to motion state
+- Prevents false rejections during high uncertainty periods
+
+### GPS Factor Integration
+- RTK GPS provides absolute position constraints
+- 2cm accuracy prevents long-term drift
+- GPS factors added to keyframes at 8Hz
+- First GPS measurement sets reference frame
+
+### Implementation Details
+- `data_association.py`: Added angular_velocity parameter for adaptive thresholds
+- `backend.py`: Added add_gps_factor() method and GPS reference tracking
+- `frontend.py`: Tracks angular velocity from odometry
+- GPS simulation publishes on `/gps/odom` topic
+- SLAM node subscribes and adds GPS constraints to factor graph
+
+### Expected Improvements
+- No divergence at track corners
+- Maintained global consistency via GPS
+- Better association during rapid viewpoint changes
+- Stable optimization convergence
+
+## V3 Debug Enhancement (2025-07-18)
+
+### Pattern Factor Debug
+- Added V3 logging throughout pattern detection pipeline
+- Pattern detector logs detection results with type and confidence
+- Backend logs when patterns are added to factor graph
+- Visualization logs pattern count before drawing
+
+### Debug Approach
+- Use tagged logging (e.g., [SLAM_PATTERN_V3]) for easy filtering
+- Monitor pattern detection: corners (60-120°), curves, straight lines
+- Track pattern signatures to avoid duplicates
+- Verify pattern factors are visualized as purple lines
+
+### Key Files Modified
+- backend.py: Enhanced pattern detection logging
+- slam_ros_node.py: V3 initialization message and pattern viz logging
+- Build with --symlink-install for immediate updates
+
+## V4 Optimization Fix (2025-07-18)
+
+### Issues Fixed
+1. **Pattern Factor Dimension Error**: Fixed "shapes (2,) and (3,) not aligned"
+   - Added defensive coding to ensure all vectors are 2D
+   - Multiple flatten()[:2] operations to guarantee 2D vectors
+   
+2. **Optimization Failure Debugging**: 
+   - Enhanced error logging with full traceback
+   - Disabled async optimization for clearer debugging
+   - Added [SLAM_OPTIMIZATION_FAILED_V4] tag
+
+3. **Build Issues**:
+   - V3 messages weren't showing → confirmed need for rebuild
+   - Using --symlink-install for immediate updates
+
+### Debug Messages
+- [SLAM_PATTERN_DETECTION_V4]: Pattern detection attempts
+- [SLAM_OPTIMIZATION_FAILED_V4]: Detailed optimization errors
+- VERSION 4 WITH OPTIMIZATION FIX: Initialization confirmation

@@ -37,6 +37,11 @@ class DummyPublisher(Node):
     def __init__(self):
         super().__init__('dummy_publisher')
         
+        # Declare operation mode
+        self.declare_parameter('operation_mode', 'simulation')
+        self.declare_parameter('simulation.use_gps', True)
+        self.declare_parameter('simulation.gps_topic', '/gps/odom')
+        
         # Declare parameters with hierarchical structure matching YAML
         self.declare_parameter('scenario.id', 1)
         self.declare_parameter('publish_rates.cones', 20.0)
@@ -80,6 +85,9 @@ class DummyPublisher(Node):
         self.declare_parameter('sensors.detection_errors.false_positive_rate', 0.002)
         self.declare_parameter('sensors.detection_errors.wrong_color_rate', 0.002)
         self.declare_parameter('sensors.detection_errors.unknown_color_rate', 0.08)
+        
+        # Get operation mode
+        self.operation_mode = self.get_parameter('operation_mode').value
         
         # Get parameters
         self.scenario = self.get_parameter('scenario.id').value
@@ -199,7 +207,11 @@ class DummyPublisher(Node):
         # Timers
         self.cone_timer = self.create_timer(1.0 / self.publish_rate, self.publish_cones)
         self.imu_timer = self.create_timer(1.0 / self.imu_rate, self.publish_imu)
-        self.gps_timer = self.create_timer(1.0 / self.gps_rate, self.publish_gps)
+        
+        # GPS timer only in simulation mode with GPS enabled
+        if self.operation_mode == 'simulation' and self.get_parameter('simulation.use_gps').value:
+            self.gps_timer = self.create_timer(1.0 / self.gps_rate, self.publish_gps)
+            
         if self.odom_sim_enabled:
             self.odom_timer = self.create_timer(1.0 / self.odom_rate, self.publish_odometry)
         self.motion_timer = self.create_timer(0.01, self.update_motion)  # 100Hz motion update
@@ -225,6 +237,10 @@ class DummyPublisher(Node):
         # Log configuration
         self.get_logger().info("Dummy publisher initialized (refactored version)")
         self.get_logger().info(f"Odometry simulation: {'ENABLED' if self.odom_sim_enabled else 'DISABLED (use external odometry)'}")
+        self.get_logger().info(f"[DUMMY_MODE] Running in mode: {self.operation_mode}")
+        if self.operation_mode == 'simulation' and self.get_parameter('simulation.use_gps').value:
+            self.get_logger().info("[DUMMY_GPS] GPS simulation enabled")
+    
     
     def update_motion(self):
         """Update robot motion using motion controller"""
@@ -295,13 +311,7 @@ class DummyPublisher(Node):
         gt_odom_to_gt_base.transform.rotation.w = q_gt[3]
         transforms.append(gt_odom_to_gt_base)
         
-        # Map -> Odom transform (identity for now - SLAM will update this)
-        map_to_odom = TransformStamped()
-        map_to_odom.header.stamp = now
-        map_to_odom.header.frame_id = "map"
-        map_to_odom.child_frame_id = "odom"
-        map_to_odom.transform.rotation.w = 1.0
-        transforms.append(map_to_odom)
+        # Do NOT publish map->odom transform - SLAM node handles this
         
         # Odom -> Base_link transform (only if odom simulation is enabled)
         if self.odom_sim_enabled:

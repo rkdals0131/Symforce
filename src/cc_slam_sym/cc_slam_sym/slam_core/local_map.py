@@ -81,6 +81,25 @@ class LocalMap:
         
         # Check if we need to remove distant landmarks
         self._remove_distant_landmarks()
+    
+    def update_all_landmarks(self, landmarks: Dict[int, Landmark]):
+        """Update all landmarks with optimized positions from backend
+        
+        Args:
+            landmarks: Dictionary of all landmarks with updated positions
+        """
+        # Update existing landmarks in local map
+        for lm_id, updated_landmark in landmarks.items():
+            if lm_id in self.local_landmarks:
+                # Update position and covariance
+                self.local_landmarks[lm_id].position = updated_landmark.position.copy()
+                if hasattr(updated_landmark, 'covariance') and updated_landmark.covariance is not None:
+                    self.local_landmarks[lm_id].covariance = updated_landmark.covariance.copy()
+                    
+        # Add any new landmarks that might have been created
+        for lm_id, landmark in landmarks.items():
+            if lm_id not in self.local_landmarks:
+                self.add_landmark(landmark)
         
     def get_nearby_landmarks(self, 
                            position: Optional[np.ndarray] = None,

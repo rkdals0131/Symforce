@@ -8,7 +8,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 from geometry_msgs.msg import Pose, Point, Quaternion, Transform, TransformStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, Imu, NavSatFix
 from std_msgs.msg import Header
 from tf2_ros import TransformBroadcaster
 import tf2_geometry_msgs
@@ -18,7 +18,7 @@ from rclpy.time import Time
 from custom_interface.msg import TrackedCone, TrackedConeArray
 
 from ..utils.data_structures import (
-    ConeCluster, OdometryData, Keyframe, Landmark
+    ConeCluster, OdometryData, Keyframe, Landmark, GpsData, ImuData
 )
 
 
@@ -132,6 +132,58 @@ class RosSlamConverter:
         )
         
         return odom_data
+    
+    @staticmethod
+    def gps_odometry_to_data(msg: Odometry) -> GpsData:
+        """Convert GPS odometry message to internal GPS data
+        
+        Note: For simulation, we're using Odometry messages with ground truth position
+        In real system, this would convert from NavSatFix to UTM coordinates
+        
+        Args:
+            msg: GPS odometry message (position in map frame)
+            
+        Returns:
+            GpsData object with UTM coordinates
+        """
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        
+        # For simulation, directly use position as UTM coordinates
+        # In real system, would convert lat/lon to UTM
+        utm_x = msg.pose.pose.position.x
+        utm_y = msg.pose.pose.position.y
+        
+        # Extract velocity if available
+        velocity_enu = np.array([
+            msg.twist.twist.linear.x,
+            msg.twist.twist.linear.y,
+            msg.twist.twist.linear.z
+        ])
+        
+        # Extract covariance - use x,y covariance from pose
+        position_cov = np.zeros((2, 2))
+        position_cov[0, 0] = msg.pose.covariance[0] if msg.pose.covariance[0] > 0 else 0.02**2  # Default 2cm
+        position_cov[0, 1] = msg.pose.covariance[1]
+        position_cov[1, 0] = msg.pose.covariance[6]
+        position_cov[1, 1] = msg.pose.covariance[7] if msg.pose.covariance[7] > 0 else 0.02**2
+        
+        # Create 3x3 position covariance (ENU)
+        position_cov_3d = np.eye(3) * 0.1**2  # Default 10cm
+        position_cov_3d[0:2, 0:2] = position_cov  # Set horizontal from message
+        position_cov_3d[2, 2] = 0.2**2  # Vertical uncertainty
+        
+        return GpsData(
+            timestamp=timestamp,
+            latitude=0.0,  # Not used in simulation
+            longitude=0.0,  # Not used in simulation
+            altitude=msg.pose.pose.position.z,
+            utm_x=utm_x,
+            utm_y=utm_y,
+            utm_zone="sim",  # Simulation zone
+            velocity_enu=velocity_enu,
+            position_covariance=position_cov_3d,
+            fix_type=4  # RTK_FIXED for simulation
+        )
     
     @staticmethod
     def pose2_to_transform(pose, timestamp: Time, 

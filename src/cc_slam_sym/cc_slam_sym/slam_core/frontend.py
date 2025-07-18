@@ -30,7 +30,7 @@ class FrontendConfig:
     association_config: AssociationConfig = field(default_factory=AssociationConfig)
     
     # Landmark initialization
-    min_observations_for_landmark: int = 2
+    min_observations_for_landmark: int = 3  # Increased to match AssociationConfig
     max_landmark_init_distance: float = 20.0     # Maximum distance to initialize landmark
     
     # Noise models
@@ -63,6 +63,7 @@ class SlamFrontend:
         # Odometry prediction for data association
         self.last_odom_pose = gtsam.Pose2(0.0, 0.0, 0.0)
         self.predicted_pose = gtsam.Pose2(0.0, 0.0, 0.0)
+        self.current_angular_velocity = 0.0  # Store current angular velocity
         
         # Verify pose initialization
         assert self.current_pose is not None, "Current pose not initialized"
@@ -124,10 +125,23 @@ class SlamFrontend:
             else:
                 self.predicted_pose = self.current_pose
         
+        # Store angular velocity for data association
+        self.current_angular_velocity = odom_data.angular_velocity
+        
         # Update local map with current pose
         self.local_map.update_current_pose(self.current_pose, odom_data.timestamp)
             
         return self.current_pose
+    
+    def get_current_keyframe(self) -> Optional[Keyframe]:
+        """Get the most recent keyframe
+        
+        Returns:
+            Most recent keyframe or None if no keyframes exist
+        """
+        if not self.keyframes:
+            return None
+        return self.keyframes[-1]
     
     def update_pose_from_backend(self, optimized_pose: gtsam.Pose2):
         """Update current pose with optimized estimate from backend
@@ -239,7 +253,8 @@ class SlamFrontend:
             observations,  # Pass observations in robot frame
             local_landmarks,
             self.current_pose,  # Current pose
-            self.predicted_pose  # Predicted pose for better matching
+            self.predicted_pose,  # Predicted pose for better matching
+            self.current_angular_velocity  # Pass angular velocity for adaptive thresholds
         )
         
         # Update existing landmarks with matched observations
@@ -259,6 +274,8 @@ class SlamFrontend:
             landmark.update_with_observation(world_obs, timestamp)
             
         # Process unmatched observations (potential new landmarks)
+        # Track which observations created new landmarks
+        new_landmark_track_ids = []
         for obs_idx in association_result.unmatched_observations:
             observation = observations[obs_idx]
             # Transform to world frame
@@ -271,7 +288,14 @@ class SlamFrontend:
                 track_id=observation.track_id,
                 covariance=observation.covariance
             )
+            # Check if this will create a new landmark
+            if observation.track_id in self.candidate_landmarks and \
+               len(self.candidate_landmarks[observation.track_id]) + 1 >= self.config.min_observations_for_landmark:
+                new_landmark_track_ids.append(observation.track_id)
             self._process_unmatched_observation(world_obs, timestamp)
+        
+        # Store new landmark info in association result for keyframe creation
+        association_result.new_landmark_track_ids = new_landmark_track_ids
             
         return association_result
         
@@ -316,6 +340,21 @@ class SlamFrontend:
         distance = np.linalg.norm(robot_to_obs)
         if distance > self.config.max_landmark_init_distance:
             return
+            
+        # Check if there's already a landmark very close to this position
+        duplicate_threshold = 0.5  # 50cm threshold for duplicate detection
+        for landmark in self.landmarks.values():
+            dist_to_landmark = np.linalg.norm(observation.position[:2] - landmark.position)
+            if dist_to_landmark < duplicate_threshold:
+                # Check color compatibility
+                if observation.color == landmark.color or observation.color == "unknown" or landmark.color == "unknown":
+                    if self.logger:
+                        self.logger.warning(f"[SLAM_DUPLICATE_PREVENTION] Observation at [{observation.position[0]:.2f},{observation.position[1]:.2f}] "
+                                          f"too close to landmark {landmark.id} at [{landmark.position[0]:.2f},{landmark.position[1]:.2f}] "
+                                          f"(dist={dist_to_landmark:.3f}m)")
+                    # Update existing landmark instead of creating new one
+                    landmark.update_with_observation(observation, timestamp)
+                    return
             
         # Track candidate landmarks
         track_id = observation.track_id

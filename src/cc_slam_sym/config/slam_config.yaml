@@ -14,18 +14,33 @@
       odom: "odom"
       base_link: "base_link"
     
+    # Operation Mode
+    operation_mode: "simulation"  # "simulation", "external_fusion", or "direct_fusion"
+    
+    # Mode-specific settings
+    simulation:
+      use_gps: true               # Enable GPS simulation
+      gps_topic: "/gps/odom"      # GPS odometry topic
+      
+    external_fusion:
+      odometry_topic: "/odometry/filtered"  # Robot localization output
+      
+    direct_fusion:
+      imu_topic: "/ouster/imu"    # IMU data for preintegration
+      gps_topic: "/ublox_gps_node/fix"  # GPS fix for absolute constraints
+    
     # Frontend Configuration
     frontend:
       # Keyframe Selection
-      keyframe_distance_threshold: 1.0    # meters (reduced from 2.0 for less info loss)
-      keyframe_rotation_threshold: 0.2    # radians (~11 degrees, reduced from 0.3)
-      keyframe_time_threshold: 0.3        # seconds (reduced from 1.0 for better temporal resolution)
+      keyframe_distance_threshold: 3.0    # meters (increased to reduce keyframe density)
+      keyframe_rotation_threshold: 0.3    # radians (~17 degrees)
+      keyframe_time_threshold: 2.0        # seconds (increased to reduce keyframe density)
       
       # Data Association
-      max_association_distance: 1.5       # meters
+      max_association_distance: 2.5       # meters (increased for better association during turns)
       require_color_match: true           # Enforce cone color matching
       use_mahalanobis: true              # Use Mahalanobis distance for robust association
-      min_observations_for_landmark: 2    # Observations before confirming landmark
+      min_observations_for_landmark: 3    # Observations before confirming landmark (increased from 2)
       max_landmark_init_distance: 20.0    # Maximum distance to initialize landmark
       
       # Noise Models
@@ -39,7 +54,7 @@
     # Backend Configuration
     backend:
       # Optimization Settings
-      optimization_interval: 10           # Optimize every N keyframes (increased due to denser keyframes)
+      optimization_interval: 5            # Optimize every N keyframes (more frequent for better tracking)
       max_iterations: 100                 # Maximum optimizer iterations
       relinearize_threshold: 0.1          # ISAM2 relinearization threshold
       relinearize_skip: 10                # ISAM2 relinearization skip
@@ -50,22 +65,22 @@
       prior_rotation_noise: 1e-6          # radians (perfect simulation)
       odometry_position_noise: 0.5        # meters (HIGHER noise - let observations correct odometry)
       odometry_rotation_noise: 0.2        # radians (HIGHER noise - let observations correct odometry)
-      landmark_observation_noise: 0.05    # meters (LOWER noise - trust observations more)
+      landmark_observation_noise: 0.2     # meters (realistic observation noise)
       
       # Robust Kernels
-      use_robust_kernels: false           # Disable for perfect simulation
+      use_robust_kernels: true            # Enable robust kernels for noise handling
       huber_parameter: 1.0                # Huber robust kernel parameter
       
       # Outlier Rejection
-      chi2_threshold: 9.0                 # Chi-squared threshold for 2 DOF at 99% confidence
-      remove_outliers: false              # Disable for perfect simulation
+      chi2_threshold: 6.0                 # Chi-squared threshold for 2 DOF at 95% confidence (lowered)
+      remove_outliers: true               # Enable outlier removal
       
       # Sliding Window
       use_sliding_window: true
-      max_keyframes: 15                   # Maximum keyframes to keep (15m coverage with 1m spacing)
+      max_keyframes: 30                   # Maximum keyframes to keep (reduced from 50)
       
       # Loop Closure (future feature)
-      enable_loop_closure: false
+      enable_loop_closure: true
       loop_closure_distance: 1.0          # meters
       loop_closure_rotation: 0.2          # radians
     

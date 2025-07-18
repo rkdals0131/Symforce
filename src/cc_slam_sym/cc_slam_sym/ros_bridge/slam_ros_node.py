@@ -44,9 +44,17 @@ class SlamNode(Node):
         # Declare parameters
         self._declare_parameters()
         
+        # Get operation mode first
+        self.operation_mode = self.get_parameter('operation_mode').value
+        self.get_logger().info(f"Starting SLAM in {self.operation_mode} mode")
+        
         # Initialize components
         self._init_slam_components()
         self._init_ros_interfaces()
+        
+        # Initialize map->odom transform (identity at start)
+        from gtsam import Pose2
+        self.map_to_odom_transform = Pose2(0.0, 0.0, 0.0)  # Identity transform initially
         
         # Create processing thread
         self.processing_thread = threading.Thread(target=self._processing_loop)
@@ -58,9 +66,14 @@ class SlamNode(Node):
         self.cone_queue = ConcurrentVector(max_size=max_queue_size)
         self.odom_queue = ConcurrentVector(max_size=max_queue_size)
         
+        # GPS queue for simulation mode with GPS enabled
+        if self.operation_mode == 'simulation' and self.get_parameter('simulation.use_gps').value:
+            self.gps_queue = ConcurrentVector(max_size=max_queue_size//2)
+        
         # State tracking
         self.last_optimization_time = time.time()
         self.frame_count = 0
+        self.keyframes_since_optimization = 0
         
         # Start processing
         self.processing_thread.start()
@@ -76,8 +89,9 @@ class SlamNode(Node):
         self.diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
         self.diag_timer = self.create_timer(1.0, self._publish_diagnostics)  # 1 Hz
         
-        self.get_logger().info("CC-SLAM-SYM node initialized")
-        
+        self.get_logger().info("CC-SLAM-SYM node initialized - VERSION 5 WITH PATTERN DEBUG")
+    
+    
     def _declare_parameters(self):
         """Declare ROS2 parameters"""
         # Topics
@@ -130,6 +144,16 @@ class SlamNode(Node):
         self.declare_parameter('performance.max_queue_size', 100)
         self.declare_parameter('performance.processing_thread_sleep', 0.001)
         
+        # Operation mode
+        self.declare_parameter('operation_mode', 'simulation')
+        
+        # Mode-specific settings
+        self.declare_parameter('simulation.use_gps', True)
+        self.declare_parameter('simulation.gps_topic', '/gps/odom')
+        self.declare_parameter('external_fusion.odometry_topic', '/odometry/filtered')
+        self.declare_parameter('direct_fusion.imu_topic', '/ouster/imu')
+        self.declare_parameter('direct_fusion.gps_topic', '/ublox_gps_node/fix')
+        
     def _init_slam_components(self):
         """Initialize SLAM components"""
         # Set up loggers for SLAM components
@@ -173,8 +197,10 @@ class SlamNode(Node):
         )
         
         # Create SLAM components with loggers
+        self.get_logger().info(f"[SLAM_INIT_DEBUG] Creating backend with logger: {self.backend_logger}")
         self.frontend = SlamFrontend(frontend_config, self.frontend_logger)
         self.backend = SlamBackend(backend_config, self.backend_logger)
+        self.get_logger().info(f"[SLAM_INIT_DEBUG] Backend created: {self.backend}, has logger: {hasattr(self.backend, 'logger')}")
         
         # Data converter
         self.converter = RosSlamConverter()
@@ -212,6 +238,30 @@ class SlamNode(Node):
             sensor_qos
         )
         
+        # Mode-specific subscriptions
+        if self.operation_mode == 'simulation' and self.get_parameter('simulation.use_gps').value:
+            gps_topic = self.get_parameter('simulation.gps_topic').value
+            self.gps_sub = self.create_subscription(
+                Odometry,
+                gps_topic,
+                self._gps_callback,
+                sensor_qos
+            )
+            self.get_logger().info(f"[SLAM_GPS] Simulation mode with GPS enabled, subscribing to {gps_topic}")
+        elif self.operation_mode == 'external_fusion':
+            # Override odometry topic for external fusion mode
+            odom_topic = self.get_parameter('external_fusion.odometry_topic').value
+            self.odom_sub = self.create_subscription(
+                Odometry,
+                odom_topic,
+                self._odometry_callback,
+                sensor_qos
+            )
+            self.get_logger().info(f"[SLAM_MODE] External fusion mode, using odometry from {odom_topic}")
+        elif self.operation_mode == 'direct_fusion':
+            # TODO: Implement IMU preintegration
+            self.get_logger().warning("[SLAM_MODE] Direct fusion mode not fully implemented yet")
+        
         # Publishers
         self.landmark_pub = self.create_publisher(
             MarkerArray, '/slam/landmarks', reliable_qos
@@ -243,9 +293,22 @@ class SlamNode(Node):
         # Queue for processing
         self.odom_queue.push_back(msg, block=False)
         
+    def _gps_callback(self, msg: Odometry):
+        """Handle GPS messages"""
+        # Queue for processing
+        if hasattr(self, 'gps_queue'):
+            self.gps_queue.push_back(msg, block=False)
+        
     def _processing_loop(self):
         """Main processing loop (runs in separate thread)"""
         while self.running:
+            # Check for async optimization results
+            if hasattr(self.backend, 'check_async_result'):
+                if self.backend.check_async_result():
+                    self.get_logger().info("[SLAM_ASYNC_OPT] Applied optimization results")
+                    # Update frontend with optimized poses
+                    self._update_frontend_with_optimized_poses()
+            
             # Process odometry
             odom_msg = self.odom_queue.try_pop_front()
             if odom_msg:
@@ -255,6 +318,12 @@ class SlamNode(Node):
             cone_msg = self.cone_queue.try_pop_front()
             if cone_msg:
                 self._process_cones(cone_msg)
+            
+            # Process GPS measurements (simulation mode only)
+            if self.operation_mode == 'simulation' and hasattr(self, 'gps_queue'):
+                gps_msg = self.gps_queue.try_pop_front()
+                if gps_msg:
+                    self._process_gps(gps_msg)
             
             # Sleep briefly to avoid busy waiting
             time.sleep(self.get_parameter('performance.processing_thread_sleep').value)
@@ -332,6 +401,8 @@ class SlamNode(Node):
                             # Get local landmarks used in association
                             local_landmarks = self.frontend.local_map.get_nearby_landmarks()
                             
+                            self.get_logger().debug(f"[SLAM_KEYFRAME_ASSOCIATION] keyframe={keyframe.id}, matched_pairs={len(keyframe.association_result.matched_pairs)}, new_landmarks={len(keyframe.association_result.new_landmark_track_ids) if hasattr(keyframe.association_result, 'new_landmark_track_ids') else 0}")
+                            
                             # Use matched pairs from association result
                             num_added = 0
                             for obs_idx, lm_idx in keyframe.association_result.matched_pairs:
@@ -350,38 +421,128 @@ class SlamNode(Node):
                                 else:
                                     self.get_logger().warning(f"[SLAM_ASSOCIATION_INDEX] Invalid indices: obs_idx={obs_idx}, lm_idx={lm_idx}, observations={len(keyframe.observations)}, landmarks={len(local_landmarks)}")
                             
+                            # Also add observation factors for newly created landmarks
+                            if hasattr(keyframe.association_result, 'new_landmark_track_ids') and keyframe.association_result.new_landmark_track_ids:
+                                self.get_logger().debug(f"[SLAM_NEW_LANDMARKS] Processing {len(keyframe.association_result.new_landmark_track_ids)} new landmarks")
+                                for track_id in keyframe.association_result.new_landmark_track_ids:
+                                    # Find the landmark with this track_id
+                                    landmark_found = False
+                                    for landmark in self.frontend.landmarks.values():
+                                        if hasattr(landmark, 'track_id') and landmark.track_id == track_id:
+                                            # Find the observation with this track_id
+                                            for observation in keyframe.observations:
+                                                if observation.track_id == track_id:
+                                                    # Update backend's landmark list
+                                                    self.backend.landmarks[landmark.id] = landmark
+                                                    
+                                                    # Add observation factor
+                                                    self.backend.add_landmark_observation(keyframe, landmark, observation)
+                                                    num_added += 1
+                                                    landmark_found = True
+                                                    
+                                                    self.get_logger().debug(f"[SLAM_ADD_NEW_LANDMARK_OBS] keyframe={keyframe.id}, new_landmark={landmark.id}, track_id={track_id}")
+                                                    break
+                                            if landmark_found:
+                                                break
+                                    if not landmark_found:
+                                        self.get_logger().warning(f"[SLAM_LANDMARK_NOT_FOUND] track_id={track_id} not found in frontend landmarks")
+                            
+                            # CRITICAL FIX: For first keyframe, ALL observations create new landmarks
+                            # but they might not be in new_landmark_track_ids yet
+                            if keyframe.id == 0 and num_added == 0:
+                                self.get_logger().warning(f"[SLAM_FIRST_KEYFRAME_FIX_V2] Keyframe 0 special handling - adding all observations")
+                                for obs_idx, observation in enumerate(keyframe.observations):
+                                    # Find landmark with matching track_id
+                                    for landmark in self.frontend.landmarks.values():
+                                        if hasattr(landmark, 'track_id') and landmark.track_id == observation.track_id:
+                                            self.backend.landmarks[landmark.id] = landmark
+                                            self.backend.add_landmark_observation(keyframe, landmark, observation)
+                                            num_added += 1
+                                            self.get_logger().debug(f"[SLAM_FIRST_KF_OBS] Added observation for landmark {landmark.id}")
+                                            break
+                            
                             self.get_logger().info(f"[SLAM_OBSERVATION_FACTORS] Added {num_added} observation factors for keyframe {keyframe.id}")
+                            
+                            # Add structural pattern factors
+                            try:
+                                self.get_logger().info(f"[SLAM_PATTERN_CALL_V5] Calling add_pattern_factors for KF {keyframe.id}")
+                                self.get_logger().info(f"[ROS_PATTERN_DEBUG] Backend object: {self.backend}, type: {type(self.backend)}")
+                                self.get_logger().info(f"[ROS_PATTERN_DEBUG] Backend has add_pattern_factors: {hasattr(self.backend, 'add_pattern_factors')}")
+                                # Test backend is working
+                                self.get_logger().info("[ROS_PATTERN_DEBUG] Testing backend...")
+                                test_result = self.backend.test_backend_v5()
+                                self.get_logger().info(f"[ROS_PATTERN_DEBUG] Backend test result: {test_result}")
+                                # Now call pattern detection
+                                self.backend.add_pattern_factors(keyframe)
+                                self.get_logger().info(f"[SLAM_PATTERN_CALL_V5] add_pattern_factors completed for KF {keyframe.id}")
+                            except Exception as e:
+                                import traceback
+                                self.get_logger().error(f"[SLAM_PATTERN_ERROR_V5] Pattern factor failed: {e}")
+                                self.get_logger().error(f"[SLAM_PATTERN_TRACE_V5] {traceback.format_exc()}")
+                            
                         else:
                             self.get_logger().warning(f"[SLAM_NO_ASSOCIATION] No association result available for keyframe {keyframe.id}")
                         
+                        self.get_logger().info(f"[SLAM_KEYFRAME_PROCESSED_V2] KF {keyframe.id} complete - ready for opt check")
+                        
                         # Check if optimization should run
-                        # Track keyframes since last optimization
-                        if not hasattr(self, 'keyframes_since_optimization'):
-                            self.keyframes_since_optimization = 0
                         self.keyframes_since_optimization += 1
                         
-                        # Debug: Show backend state before optimization check
-                        self.get_logger().debug(f"[SLAM_BACKEND_STATE] graph_size={self.backend.graph.size() if self.backend.graph else 0}, factors_since_opt={self.backend.factors_since_optimization}, keyframes_since_opt={self.keyframes_since_optimization}")
+                        # Always log state for debugging
+                        self.get_logger().info(f"[SLAM_BACKEND_STATE_V2] graph_size={self.backend.graph.size() if self.backend.graph else 0}, "
+                                             f"factors_since_opt={self.backend.factors_since_optimization}, "
+                                             f"keyframes_since_opt={self.keyframes_since_optimization}, "
+                                             f"total_kf={len(self.backend.keyframes)}, "
+                                             f"opt_interval={self.backend.config.optimization_interval}")
                         
-                        if self.keyframes_since_optimization >= self.backend.config.optimization_interval:
-                            self.get_logger().info(f"[SLAM_TRIGGER_OPTIMIZATION] keyframes={self.keyframes_since_optimization}")
+                        # Trigger optimization based on total keyframes, not consecutive count
+                        total_keyframes = len(self.backend.keyframes)
+                        # Trigger every N keyframes OR if we have at least N keyframes and haven't optimized yet
+                        if total_keyframes >= self.backend.config.optimization_interval and \
+                           (total_keyframes % self.backend.config.optimization_interval == 0 or \
+                            self.backend.factors_since_optimization >= self.backend.config.optimization_interval * 10):
+                            self.get_logger().info(f"[SLAM_TRIGGER_OPTIMIZATION_V2] total_keyframes={total_keyframes}, triggering optimization NOW!")
                             self._perform_optimization()
                             self.keyframes_since_optimization = 0
                             
                             # Update frontend with optimized current pose
                             self._update_frontend_with_optimized_poses()
+                        else:
+                            self.get_logger().info(f"[SLAM_NO_OPT_YET_V2] consecutive={self.keyframes_since_optimization}/{self.backend.config.optimization_interval}, total={total_keyframes}")
                         
                         self.get_logger().debug(f"Backend now has {len(self.backend.keyframes)} keyframes")
                             
         except Exception as e:
             self.get_logger().error(f"Error processing cones: {e}")
+    
+    def _process_gps(self, msg: Odometry):
+        """Process GPS measurements"""
+        try:
+            with self.slam_lock:
+                # Convert to internal format
+                gps_data = self.converter.gps_odometry_to_data(msg)
+                
+                # Get current keyframe
+                current_keyframe = self.frontend.get_current_keyframe()
+                if current_keyframe is None:
+                    # No keyframe yet, wait for SLAM to initialize
+                    return
+                
+                # Add GPS factor to backend
+                self.backend.add_gps_factor(current_keyframe, gps_data)
+                
+                self.get_logger().debug(f"[SLAM_GPS_UPDATE] Added GPS constraint to keyframe {current_keyframe.id} at [{gps_data.utm_x:.2f}, {gps_data.utm_y:.2f}]")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error processing GPS: {e}")
             
     def _perform_optimization(self):
         """Run backend optimization"""
         try:
             self.get_logger().info("[SLAM_OPTIMIZATION_START] Running backend optimization")
             start_time = time.time()
-            success = self.backend.optimize()
+            # Disable async optimization for debugging
+            success = self.backend.optimize(use_async=False)
             
             if success:
                 opt_time = time.time() - start_time
@@ -429,17 +590,117 @@ class SlamNode(Node):
                 # Update frontend current pose
                 self.frontend.update_pose_from_backend(optimized_pose)
                 
+                # Update map->odom transform
+                self._update_map_to_odom_transform(optimized_pose, latest_keyframe)
+                
+                # Update frontend landmarks with optimized positions
+                self._update_frontend_landmarks()
+                
                 self.get_logger().info(f"[SLAM_FRONTEND_UPDATE] pose=[{optimized_pose.x():.3f},{optimized_pose.y():.3f},{optimized_pose.theta():.3f}]")
             else:
                 self.get_logger().warning(f"[SLAM_NO_OPTIMIZED_POSE] keyframe={latest_keyframe_id}")
                 
         except Exception as e:
             self.get_logger().error(f"Error updating frontend with optimized poses: {e}")
+    
+    def _update_map_to_odom_transform(self, optimized_pose_map, keyframe):
+        """Compute and publish map->odom transform based on optimization results"""
+        try:
+            # Get the odometry pose for this keyframe (what odometry thought the pose was)
+            odom_pose = keyframe.pose  # This is the original odometry pose
+            
+            if odom_pose is None:
+                self.get_logger().warning("Keyframe has no odometry pose, cannot compute map->odom transform")
+                return
+            
+            # Compute map->odom transform
+            # map_T_base = map_T_odom * odom_T_base
+            # Therefore: map_T_odom = map_T_base * base_T_odom
+            # Which is: map_T_odom = optimized_pose * inverse(odom_pose)
+            map_to_odom = optimized_pose_map.compose(odom_pose.inverse())
+            
+            # Store the transform for continuous publishing
+            self.map_to_odom_transform = map_to_odom
+            
+            # Publish the transform
+            timestamp = self.get_clock().now()
+            self.tf_publisher.publish_map_to_odom(map_to_odom, timestamp)
+            
+            # Also publish TF immediately if enabled
+            if self.get_parameter('visualization.publish_tf').value:
+                # Create transform message
+                transform = self.converter.pose2_to_transform(
+                    map_to_odom, timestamp, "odom", "map"
+                )
+                self.tf_broadcaster.sendTransform(transform)
+                
+            self.get_logger().debug(f"[SLAM_TF_UPDATE] Published map->odom transform: [{map_to_odom.x():.3f},{map_to_odom.y():.3f},{map_to_odom.theta():.3f}]")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error publishing map->odom transform: {e}")
+    
+    def _update_frontend_landmarks(self):
+        """Update frontend landmarks with optimized positions from backend"""
+        try:
+            if not self.backend.current_estimate:
+                return
+                
+            updated_count = 0
+            position_changes = []
+            
+            # Update each landmark in frontend with backend's optimized position
+            for landmark_id, backend_landmark in self.backend.landmarks.items():
+                if landmark_id in self.frontend.landmarks:
+                    frontend_landmark = self.frontend.landmarks[landmark_id]
+                    
+                    # Store old position for comparison
+                    old_pos = frontend_landmark.position.copy()
+                    
+                    # Update position from backend
+                    frontend_landmark.position = backend_landmark.position.copy()
+                    
+                    # Update covariance if available
+                    if hasattr(backend_landmark, 'covariance') and backend_landmark.covariance is not None:
+                        frontend_landmark.covariance = backend_landmark.covariance.copy()
+                    
+                    # Calculate position change
+                    pos_change = np.linalg.norm(old_pos - frontend_landmark.position)
+                    position_changes.append(pos_change)
+                    
+                    if pos_change > 0.01:  # Log significant changes
+                        self.get_logger().debug(f"[SLAM_LANDMARK_UPDATE] lm={landmark_id}, "
+                                              f"old_pos=[{old_pos[0]:.3f},{old_pos[1]:.3f}], "
+                                              f"new_pos=[{frontend_landmark.position[0]:.3f},{frontend_landmark.position[1]:.3f}], "
+                                              f"change={pos_change:.3f}m")
+                    
+                    updated_count += 1
+            
+            # Update local map with new positions
+            if hasattr(self.frontend, 'local_map') and self.frontend.local_map:
+                self.frontend.local_map.update_all_landmarks(self.frontend.landmarks)
+                
+            if updated_count > 0:
+                avg_change = np.mean(position_changes) if position_changes else 0.0
+                max_change = np.max(position_changes) if position_changes else 0.0
+                self.get_logger().info(f"[SLAM_LANDMARKS_UPDATED] count={updated_count}, "
+                                     f"avg_change={avg_change:.3f}m, max_change={max_change:.3f}m")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error updating frontend landmarks: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
             
     def _visualization_callback(self):
         """Publish visualization data"""
         try:
             current_time = self.get_clock().now()
+            
+            # Always publish map->odom transform if available
+            if self.map_to_odom_transform is not None and self.get_parameter('visualization.publish_tf').value:
+                transform = self.converter.pose2_to_transform(
+                    self.map_to_odom_transform, current_time, "odom", "map"
+                )
+                self.tf_broadcaster.sendTransform(transform)
             
             with self.slam_lock:
                 # Publish landmarks
@@ -663,6 +924,67 @@ class SlamNode(Node):
                     marker_array.markers.append(marker)
                     marker_id += 1
         
+        # Visualize pattern factors (landmark-to-landmark constraints)
+        self.get_logger().info(f"[SLAM_VIZ_DEBUG_V5] Checking patterns: has_attr={hasattr(self.backend, 'detected_patterns')}, "
+                             f"patterns={self.backend.detected_patterns if hasattr(self.backend, 'detected_patterns') else 'NO_ATTR'}, "
+                             f"len={len(self.backend.detected_patterns) if hasattr(self.backend, 'detected_patterns') else 0}")
+        if hasattr(self.backend, 'detected_patterns') and self.backend.detected_patterns:
+            self.get_logger().info(f"[SLAM_VIZ_PATTERN_V3] Visualizing {len(self.backend.detected_patterns)} patterns")
+            for pattern_signature in self.backend.detected_patterns:
+                # pattern_signature is a tuple of landmark symbols
+                if len(pattern_signature) >= 3:
+                    # Draw lines connecting all landmarks in the pattern
+                    landmark_positions = []
+                    all_landmarks_exist = True
+                    
+                    for lm_symbol in pattern_signature:
+                        if self.backend.current_estimate and self.backend.current_estimate.exists(lm_symbol):
+                            try:
+                                lm_point = self.backend.current_estimate.atPoint2(lm_symbol)
+                                landmark_positions.append(np.array([lm_point[0], lm_point[1]]))
+                            except:
+                                all_landmarks_exist = False
+                                break
+                        else:
+                            all_landmarks_exist = False
+                            break
+                    
+                    if all_landmarks_exist and len(landmark_positions) >= 3:
+                        # Create line marker connecting all landmarks in pattern
+                        marker = Marker()
+                        marker.header.stamp = timestamp.to_msg()
+                        marker.header.frame_id = self.get_parameter('frames.map').value
+                        marker.ns = "graph_patterns"
+                        marker.id = marker_id
+                        marker.type = Marker.LINE_STRIP
+                        marker.action = Marker.ADD
+                        
+                        # Add all points
+                        for pos in landmark_positions:
+                            p = Point()
+                            p.x = pos[0]
+                            p.y = pos[1]
+                            p.z = 0.1  # Slightly above ground
+                            marker.points.append(p)
+                        
+                        # Close the loop for patterns
+                        p = Point()
+                        p.x = landmark_positions[0][0]
+                        p.y = landmark_positions[0][1]
+                        p.z = 0.1
+                        marker.points.append(p)
+                        
+                        marker.scale.x = 0.08  # Thicker line for patterns
+                        
+                        # Purple color for pattern constraints
+                        marker.color.r = 0.8
+                        marker.color.g = 0.0
+                        marker.color.b = 0.8
+                        marker.color.a = 0.7
+                        
+                        marker_array.markers.append(marker)
+                        marker_id += 1
+        
         # Visualize pose-to-landmark factors
         for kf_id, kf in self.backend.keyframes.items():
             pose = None
@@ -786,6 +1108,9 @@ class SlamNode(Node):
         self.running = False
         if self.processing_thread.is_alive():
             self.processing_thread.join()
+        # Shutdown async optimizer if it exists
+        if hasattr(self.backend, 'async_optimizer'):
+            self.backend.async_optimizer.shutdown()
         super().destroy_node()
 
 

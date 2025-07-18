@@ -6,7 +6,7 @@ Handles matching between cone observations and landmarks in the map
 
 import numpy as np
 from typing import List, Tuple, Optional, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from scipy.spatial import KDTree
 import gtsam
 import time
@@ -20,16 +20,17 @@ class AssociationResult:
     matched_pairs: List[Tuple[int, int]]  # (observation_idx, landmark_idx)
     unmatched_observations: List[int]     # Indices of new cone detections
     unmatched_landmarks: List[int]        # Indices of potentially lost landmarks
+    new_landmark_track_ids: List[int] = field(default_factory=list)  # Track IDs of newly created landmarks
     
     
 @dataclass
 class AssociationConfig:
     """Configuration for data association"""
-    max_distance_threshold: float = 2.0   # Maximum distance for association (meters)
+    max_distance_threshold: float = 1.5   # Maximum distance for association (meters) - reduced to prevent duplicates
     color_match_required: bool = True     # Require color match for association
     use_mahalanobis: bool = True         # Use Mahalanobis distance
     min_observations_for_landmark: int = 2  # Min observations before creating landmark
-    base_chi2_threshold: float = 0.90        # Base chi-squared confidence level
+    base_chi2_threshold: float = 0.95        # Base chi-squared confidence level (95% confidence - more permissive)
     loop_closure_threshold_scale: float = 2.0 # Scale factor for loop closure scenarios
     min_landmarks_for_loop_closure: int = 3  # Min landmarks to consider loop closure
     
@@ -59,7 +60,8 @@ class DataAssociation:
                   observations: List[ConeCluster], 
                   landmarks: List[Landmark],
                   robot_pose: Optional[gtsam.Pose2] = None,
-                  predicted_pose: Optional[gtsam.Pose2] = None) -> AssociationResult:
+                  predicted_pose: Optional[gtsam.Pose2] = None,
+                  angular_velocity: float = 0.0) -> AssociationResult:
         """Associate cone observations with existing landmarks using Mahalanobis distance
         
         Args:
@@ -75,7 +77,8 @@ class DataAssociation:
             return AssociationResult(
                 matched_pairs=[],
                 unmatched_observations=[],
-                unmatched_landmarks=list(range(len(landmarks)))
+                unmatched_landmarks=list(range(len(landmarks))),
+                new_landmark_track_ids=[]
             )
             
         if not landmarks:
@@ -83,7 +86,8 @@ class DataAssociation:
             return AssociationResult(
                 matched_pairs=[],
                 unmatched_observations=list(range(len(observations))),
-                unmatched_landmarks=[]
+                unmatched_landmarks=[],
+                new_landmark_track_ids=[]
             )
             
         # Detect potential loop closure based on landmark age
@@ -93,14 +97,18 @@ class DataAssociation:
         from scipy.stats import chi2
         base_threshold = chi2.ppf(self.config.base_chi2_threshold, df=2)
         
+        # Adaptive chi-squared threshold based on motion state
+        # Higher angular velocity = more uncertainty = need more permissive threshold
+        angular_velocity_scale = 1.0 + abs(angular_velocity) * 0.5  # Scale up to 2x at 2 rad/s
+        
         if is_potential_loop_closure:
-            chi2_threshold = base_threshold * self.config.loop_closure_threshold_scale
+            chi2_threshold = base_threshold * self.config.loop_closure_threshold_scale * angular_velocity_scale
             if self.logger:
-                self.logger.info(f"[SLAM_LOOP_CLOSURE] ACTIVATED - threshold={chi2_threshold:.3f} (base={base_threshold:.3f})")
+                self.logger.info(f"[SLAM_LOOP_CLOSURE] ACTIVATED - threshold={chi2_threshold:.3f} (base={base_threshold:.3f}, angular_vel_scale={angular_velocity_scale:.2f})")
         else:
-            chi2_threshold = base_threshold
+            chi2_threshold = base_threshold * angular_velocity_scale
             if self.logger:
-                self.logger.debug(f"[SLAM_ASSOCIATION] Using standard chi-squared threshold: {chi2_threshold:.3f}")
+                self.logger.debug(f"[SLAM_ASSOCIATION] Chi2 threshold: {chi2_threshold:.3f} (angular_vel={angular_velocity:.3f} rad/s, scale={angular_velocity_scale:.2f})")
         
         # Track which landmarks have been matched
         matched_landmark_set = set()
@@ -125,9 +133,11 @@ class DataAssociation:
                 obs_world = pose_for_association.transformFrom(observation.position[:2])
                 
                 # Find candidate landmarks within a reasonable radius
+                # Increase search radius during turns to account for uncertainty
+                search_radius_scale = 1.0 + abs(angular_velocity) * 0.3  # Up to 1.6x at 2 rad/s
                 candidate_indices = kdtree.query_ball_point(
                     obs_world, 
-                    r=self.config.max_distance_threshold * 2  # Larger radius for candidates
+                    r=self.config.max_distance_threshold * 2 * search_radius_scale
                 )
                 
                 best_match = None
@@ -263,7 +273,8 @@ class DataAssociation:
         return AssociationResult(
             matched_pairs=matched_pairs,
             unmatched_observations=unmatched_observations,
-            unmatched_landmarks=unmatched_landmarks
+            unmatched_landmarks=unmatched_landmarks,
+            new_landmark_track_ids=[]
         )
     
     def _detect_loop_closure(self, landmarks: List[Landmark], robot_pose: gtsam.Pose2) -> bool:

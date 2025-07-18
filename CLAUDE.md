@@ -97,3 +97,19 @@ The project has a comprehensive development plan (20250608.md) targeting:
 - Batch optimization for efficiency
 - Resource monitoring and adaptive configuration
 - Huber kernel for robust optimization
+
+## Packages
+
+### cc_slam_sym
+A Formula Student Driverless SLAM system using SymForce for optimized factor computation with GTSAM backend. Currently experiencing divergence issues with SymForce integration.
+
+### cone_stellation
+**ConeSTELLATION** (Cone-based STructural ELement Layout for Autonomous NavigaTION) - A new cone-based Graph SLAM system inspired by GLIM's modular architecture. This package is being developed as an alternative to cc_slam_sym, using direct GTSAM integration without SymForce.
+
+Key features:
+- Modular plugin-based architecture (following GLIM design patterns)
+- Processes cone detections with YOLO color classification
+- Asynchronous processing pipeline for real-time performance
+- Clear separation between core library and ROS2 wrapper
+
+Status: Initial development phase (started 2025-07-18)

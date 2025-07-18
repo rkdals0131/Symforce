@@ -21,6 +21,7 @@ from .symforce_gtsam_factors_stable import (
     create_symforce_motion_factor,
     color_string_to_float
 )
+from ..utils.async_optimization import AsyncOptimizer
 
 
 @dataclass
@@ -40,8 +41,9 @@ class BackendConfig:
     landmark_observation_noise: float = 0.3 # meters
     
     # Robust kernels
-    use_robust_kernels: bool = True
-    huber_parameter: float = 1.0            # Huber robust kernel parameter
+    use_robust_kernels: bool = False        # Currently disabled - causes convergence issues
+    huber_parameter: float = 1.345          # Huber robust kernel parameter (95% efficiency)
+    robust_kernel_type: str = "huber"       # Options: "huber", "cauchy", "tukey"
     
     # Outlier rejection
     chi2_threshold: float = 9.0             # Chi-squared threshold for outlier rejection (99% for 2 DOF)
@@ -68,7 +70,17 @@ class SlamBackend:
         # GTSAM structures
         self.graph = gtsam.NonlinearFactorGraph()
         self.initial_values = gtsam.Values()
-        self.current_estimate = None  # Will be created after first optimization
+        self.current_estimate = gtsam.Values()  # Initialize empty instead of None
+        
+        # Pattern detection for structural constraints
+        if self.logger:
+            self.logger.info("[BACKEND_INIT_V5] Initializing pattern detector...")
+        from .cone_pattern_factor import ConePatternDetector
+        self.pattern_detector = ConePatternDetector(logger=self.logger)
+        self.detected_patterns = []  # Store detected patterns to avoid duplicates
+        if self.logger:
+            self.logger.info(f"[BACKEND_INIT_V5] Pattern detector initialized: {self.pattern_detector}")
+            self.logger.info(f"[BACKEND_INIT_V5] Backend add_pattern_factors method: {self.add_pattern_factors}")
         
         # ISAM2 for incremental optimization with performance tuning
         params = gtsam.ISAM2Params()
@@ -82,6 +94,11 @@ class SlamBackend:
         
         self.isam2 = gtsam.ISAM2(params)
         
+        # Initialize AsyncOptimizer for non-blocking optimization
+        self.async_optimizer = AsyncOptimizer(max_queue_size=3, logger=logger)
+        self.pending_optimization = False
+        self.last_optimization_request_id = -1
+        
         # Tracking
         self.optimized_keyframes: List[int] = []
         self.optimized_landmarks: List[int] = []
@@ -94,6 +111,10 @@ class SlamBackend:
         # Storage for keyframes and landmarks
         self.keyframes = {}
         self.landmarks = {}
+        
+        # GPS reference point (first GPS fix)
+        self.gps_reference_utm = None
+        self.gps_reference_pose = None
         
         # Statistics
         self.optimization_stats = {
@@ -235,7 +256,7 @@ class SlamBackend:
             landmark_color=landmark.color,
             position_noise=self.config.landmark_observation_noise,
             color_weight=color_weight,
-            use_bearing_range=False  # Use Cartesian formulation
+            use_bearing_range=self.config.use_robust_kernels  # Use as flag for robust kernels
         )
         
         # Add factor to graph
@@ -270,15 +291,34 @@ class SlamBackend:
             obs_robot = observation.position[:2]
             obs_world = keyframe_pose.transformFrom(obs_robot)
             
-            # Initialize landmark position in world frame
-            self.initial_values.insert(
-                landmark.symbol,
-                gtsam.Point2(obs_world[0], obs_world[1])
-            )
-            self.new_values_count += 1
+            # Check for existing landmarks at this position before initializing
+            duplicate_found = False
+            for lm_id, existing_lm in self.landmarks.items():
+                if lm_id != landmark.id and self.initial_values.exists(existing_lm.symbol):
+                    try:
+                        existing_pos = self.initial_values.atPoint2(existing_lm.symbol)
+                        dist = np.sqrt((existing_pos[0] - obs_world[0])**2 + (existing_pos[1] - obs_world[1])**2)
+                        
+                        if dist < 0.5:  # 50cm threshold
+                            if self.logger:
+                                self.logger.warning(f"[SLAM_DUPLICATE_PREVENTED] New landmark {landmark.id} too close to existing {lm_id} "
+                                                  f"(dist={dist:.3f}m), skipping initialization")
+                            duplicate_found = True
+                            # Don't initialize this landmark, merge with existing
+                            return
+                    except:
+                        pass
             
-            # Update landmark position estimate
-            landmark.position = obs_world
+            if not duplicate_found:
+                # Initialize landmark position in world frame
+                self.initial_values.insert(
+                    landmark.symbol,
+                    gtsam.Point2(obs_world[0], obs_world[1])
+                )
+                self.new_values_count += 1
+                
+                # Update landmark position estimate
+                landmark.position = obs_world
             
             if self.logger:
                 self.logger.info(f"[SLAM_LANDMARK_CREATED] landmark={landmark.symbol}, world_pos=[{obs_world[0]:.3f},{obs_world[1]:.3f}], keyframe_pose=[{keyframe_pose.x():.3f},{keyframe_pose.y():.3f},{keyframe_pose.theta():.3f}], robot_obs=[{obs_robot[0]:.3f},{obs_robot[1]:.3f}]")
@@ -299,6 +339,192 @@ class SlamBackend:
         # In real implementation, compare with actual measurement
         # For now, return zero error
         return np.zeros(2)
+    
+    def test_backend_v5(self):
+        """Simple test method to verify backend is accessible"""
+        if self.logger:
+            self.logger.info("[BACKEND_TEST_V5] Backend test method called successfully!")
+        return True
+    
+    def add_pattern_factors(self, keyframe: Keyframe):
+        """Detect and add structural pattern factors for cone observations
+        
+        Args:
+            keyframe: Keyframe with cone observations
+        """
+        # V5 DEBUG: FORCE LOGGING for debugging
+        import logging
+        force_logger = logging.getLogger('slam_debug')
+        force_logger.info(f"[FORCE_BACKEND_PATTERN_V5] add_pattern_factors CALLED for KF {keyframe.id}")
+        force_logger.info(f"[FORCE_BACKEND_PATTERN_V5] self.logger = {self.logger}")
+        
+        # V5 DEBUG: Log to verify method is entered
+        if self.logger:
+            self.logger.info(f"[BACKEND_PATTERN_V5] add_pattern_factors CALLED for KF {keyframe.id}")
+            self.logger.info(f"[BACKEND_PATTERN_V5] keyframe has {len(keyframe.observations) if hasattr(keyframe, 'observations') else 'NO'} observations")
+            self.logger.info(f"[BACKEND_PATTERN_V5] keyframe type: {type(keyframe)}, has observations: {hasattr(keyframe, 'observations')}")
+            self.logger.info(f"[SLAM_PATTERN_DETECTION_V5] ENTRY: Called for KF {keyframe.id} with {len(keyframe.observations)} observations")
+        else:
+            force_logger.error("[FORCE_BACKEND_PATTERN_V5] LOGGER IS NONE!")
+            
+        if not hasattr(keyframe, 'observations'):
+            if self.logger:
+                self.logger.error("[BACKEND_PATTERN_V5] ERROR: Keyframe has no observations attribute!")
+            return
+            
+        if len(keyframe.observations) < 3:
+            if self.logger:
+                self.logger.info(f"[BACKEND_PATTERN_V5] Skipping - only {len(keyframe.observations)} observations")
+                self.logger.info(f"[SLAM_PATTERN_DETECTION_V5] SKIP: Not enough observations ({len(keyframe.observations)} < 3)")
+            return
+            
+        # Get cone positions in robot frame
+        # V5 FIX: Ensure we extract only 2D positions
+        cone_positions = []
+        for obs in keyframe.observations:
+            if hasattr(obs, 'position') and len(obs.position) >= 2:
+                cone_positions.append([float(obs.position[0]), float(obs.position[1])])
+        cone_positions = np.array(cone_positions)
+        
+        if self.logger:
+            self.logger.info(f"[SLAM_PATTERN_DETECTION_V5] PROCESSING: {len(cone_positions)} cones from KF {keyframe.id}")
+        
+        # Detect patterns
+        patterns = self.pattern_detector.detect_patterns(cone_positions)
+        
+        if self.logger:
+            self.logger.info(f"[SLAM_PATTERN_RESULT_V3] DETECT RESULT: Found {len(patterns)} patterns from {len(cone_positions)} cone positions")
+            for i, pattern in enumerate(patterns):
+                self.logger.info(f"[SLAM_PATTERN_V3] Pattern {i}: type={pattern.pattern_type.value}, "
+                               f"indices={pattern.cone_indices}, confidence={pattern.confidence:.2f}")
+        
+        if not patterns:
+            if self.logger:
+                self.logger.debug("[SLAM_PATTERN_DETECTION] No patterns detected")
+            return
+            
+        if self.logger:
+            self.logger.info(f"[SLAM_PATTERN_DETECTION] Found {len(patterns)} patterns")
+            
+        # Process each detected pattern
+        for pattern in patterns:
+            # Map observation indices to landmark IDs
+            landmark_keys = []
+            all_landmarks_exist = True
+            
+            # V5 FIX: Use association result to map observations to landmarks
+            if not hasattr(keyframe, 'association_result') or keyframe.association_result is None:
+                if self.logger:
+                    self.logger.debug(f"[SLAM_PATTERN_DETECTION_V5] No association result for keyframe {keyframe.id}")
+                continue
+                
+            # Create a mapping from observation index to landmark
+            obs_to_landmark = {}
+            for obs_idx, lm_idx in keyframe.association_result.matched_pairs:
+                # Get the landmark from the local landmarks list
+                local_landmarks = list(self.landmarks.values())
+                if lm_idx < len(local_landmarks):
+                    obs_to_landmark[obs_idx] = local_landmarks[lm_idx]
+            
+            for cone_idx in pattern.cone_indices:
+                if cone_idx in obs_to_landmark:
+                    landmark = obs_to_landmark[cone_idx]
+                    landmark_keys.append(landmark.symbol)
+                else:
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_PATTERN_DETECTION_V5] No landmark match for observation index {cone_idx}")
+                    all_landmarks_exist = False
+                    break
+                        
+            # Only add pattern factor if all landmarks exist
+            if all_landmarks_exist and len(landmark_keys) >= 3:
+                # Check if this pattern was already added (avoid duplicates)
+                pattern_signature = tuple(sorted(landmark_keys))
+                if pattern_signature not in self.detected_patterns:
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_PATTERN_DETECTION] Adding new pattern with landmarks: {[int(k) for k in landmark_keys]}")
+                    # Create appropriate noise model based on pattern type
+                    from .cone_pattern_factor import ConePatternFactor, PatternType
+                    
+                    if pattern.pattern_type == PatternType.CORNER_90:
+                        noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.05, 0.1]))  # Angle, distance ratio
+                    elif pattern.pattern_type == PatternType.CURVE:
+                        noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.2, 0.2, 0.1]))  # Center x,y, radius
+                    elif pattern.pattern_type == PatternType.STRAIGHT:
+                        noise_dim = 2 + len(landmark_keys)  # Direction + perpendicular distances
+                        noise = gtsam.noiseModel.Diagonal.Sigmas(np.ones(noise_dim) * 0.1)
+                    else:
+                        continue
+                        
+                    # Add pattern factor
+                    pattern_factor = ConePatternFactor(landmark_keys, pattern, noise)
+                    self.graph.add(pattern_factor)
+                    self.detected_patterns.append(pattern_signature)
+                    
+                    if self.logger:
+                        self.logger.info(f"[SLAM_PATTERN_FACTOR_V3] ADDED FACTOR: {pattern.pattern_type.value} pattern "
+                                       f"with {len(landmark_keys)} landmarks, confidence={pattern.confidence:.2f}, "
+                                       f"signature={[int(k) for k in pattern_signature]}")
+                        self.logger.info(f"[SLAM_PATTERN_V3] Total patterns stored: {len(self.detected_patterns)}")
+                else:
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_PATTERN_DETECTION] Pattern already exists: {[int(k) for k in sorted(landmark_keys)]}")
+            else:
+                if self.logger:
+                    self.logger.debug(f"[SLAM_PATTERN_DETECTION] Skipping pattern - all_landmarks_exist={all_landmarks_exist}, num_landmarks={len(landmark_keys)}")
+    
+    def add_gps_factor(self, keyframe: Keyframe, gps_data: GpsData):
+        """Add GPS position factor to constrain absolute position
+        
+        Args:
+            keyframe: Keyframe to constrain
+            gps_data: GPS measurement in UTM coordinates
+        """
+        if not keyframe.pose_symbol:
+            return
+            
+        # Initialize GPS reference on first measurement
+        if self.gps_reference_utm is None:
+            self.gps_reference_utm = np.array([gps_data.utm_x, gps_data.utm_y])
+            self.gps_reference_pose = keyframe.pose_symbol
+            # Add strong prior at GPS reference
+            prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.1, 0.1, 0.1]))  # 10cm position, 0.1 rad rotation
+            prior_factor = gtsam.PriorFactorPose2(
+                keyframe.pose_symbol,
+                gtsam.Pose2(0.0, 0.0, 0.0),  # Reference at origin
+                prior_noise
+            )
+            self.graph.add(prior_factor)
+            if self.logger:
+                self.logger.info(f"[SLAM_GPS_REFERENCE] Set GPS reference at UTM [{gps_data.utm_x:.2f}, {gps_data.utm_y:.2f}]")
+            return
+            
+        # Convert GPS to relative position from reference
+        gps_relative = np.array([gps_data.utm_x, gps_data.utm_y]) - self.gps_reference_utm
+        
+        # Create GPS factor with appropriate noise
+        # RTK GPS typical accuracy: 1-2cm horizontal
+        gps_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([0.02, 0.02]))  # 2cm standard deviation
+        
+        # Create position constraint factor using CustomFactor
+        # This constrains the position of the keyframe to match GPS measurement
+        target_point = gtsam.Point2(gps_relative[0], gps_relative[1])
+        
+        position_factor = gtsam.CustomFactor(
+            gps_noise,
+            [keyframe.pose_symbol],
+            lambda pose: self._gps_residual(pose, target_point)
+        )
+        
+        self.graph.add(position_factor)
+        self.factors_since_optimization += 1
+        
+        if self.logger:
+            self.logger.debug(f"[SLAM_GPS_FACTOR] Added GPS constraint for keyframe {keyframe.id} at relative position [{gps_relative[0]:.2f}, {gps_relative[1]:.2f}]")
+    
+    def _gps_residual(self, pose: gtsam.Pose2, target: gtsam.Point2) -> np.ndarray:
+        """Compute residual between pose position and GPS target"""
+        return np.array([pose.x() - target[0], pose.y() - target[1]])
         
     def add_loop_closure(self,
                         keyframe1: Keyframe,
@@ -328,7 +554,7 @@ class SlamBackend:
         )
         self.graph.add(factor)
         
-    def optimize(self) -> bool:
+    def optimize(self, use_async: bool = True) -> bool:
         """Run optimization on the factor graph with performance improvements
         
         Returns:
@@ -406,20 +632,33 @@ class SlamBackend:
             if self.logger:
                 self.logger.debug(f"[SLAM_FACTOR_BREAKDOWN] odometry_factors={odometry_factors}, odometry_error={odometry_error:.6f}, observation_factors={observation_factors}, observation_error={observation_error:.6f}")
             
-            # Batch optimization with verbose output
-            optimizer_params = gtsam.LevenbergMarquardtParams()
-            optimizer_params.setVerbosity("ERROR")  # Show optimization progress
-            optimizer_params.setMaxIterations(100)
-            optimizer_params.setRelativeErrorTol(1e-5)
-            optimizer_params.setAbsoluteErrorTol(1e-5)
-            
-            try:
-                optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, combined_values, optimizer_params)
-                self.current_estimate = optimizer.optimize()
-            except Exception as opt_error:
-                if self.logger:
-                    self.logger.error(f"[SLAM_OPTIMIZATION_ERROR] error_type={type(opt_error).__name__}, error_msg={str(opt_error)}, graph_size={self.graph.size()}, values_size={combined_values.size()}")
-                raise opt_error
+            if use_async:
+                # Request async optimization
+                success = self.async_optimizer.request_optimization(self.graph, combined_values)
+                if success:
+                    self.pending_optimization = True
+                    if self.logger:
+                        self.logger.info("[SLAM_ASYNC_OPT] Optimization requested")
+                    return True  # Optimization started
+                else:
+                    if self.logger:
+                        self.logger.warning("[SLAM_ASYNC_OPT] Failed to queue optimization")
+                    return False
+            else:
+                # Synchronous optimization (fallback)
+                optimizer_params = gtsam.LevenbergMarquardtParams()
+                optimizer_params.setVerbosity("ERROR")  # Show optimization progress
+                optimizer_params.setMaxIterations(100)
+                optimizer_params.setRelativeErrorTol(1e-5)
+                optimizer_params.setAbsoluteErrorTol(1e-5)
+                
+                try:
+                    optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, combined_values, optimizer_params)
+                    self.current_estimate = optimizer.optimize()
+                except Exception as opt_error:
+                    if self.logger:
+                        self.logger.error(f"[SLAM_OPTIMIZATION_ERROR] error_type={type(opt_error).__name__}, error_msg={str(opt_error)}, graph_size={self.graph.size()}, values_size={combined_values.size()}")
+                    raise opt_error
             
             # Debug: Verify current_estimate is properly populated
             if self.logger:
@@ -461,8 +700,16 @@ class SlamBackend:
                 if self.logger:
                     self.logger.warning("[SLAM_NO_POSE_CHANGES] Optimization ran but no poses were corrected!")
             
-            # Clear initial values after they've been used in optimization
-            self.initial_values.clear()
+            # IMPORTANT: Do NOT clear initial_values - they might be needed for new landmarks
+            # Instead, update initial_values with optimized values
+            for key in self.current_estimate.keys():
+                try:
+                    if chr(gtsam.Symbol(key).chr()) == 'x':
+                        self.initial_values.update(key, self.current_estimate.atPose2(key))
+                    elif chr(gtsam.Symbol(key).chr()) == 'l':
+                        self.initial_values.update(key, self.current_estimate.atPoint2(key))
+                except:
+                    pass
             
             # Keep the graph for continuous optimization
             # self.graph = gtsam.NonlinearFactorGraph()  # DON'T clear graph
@@ -517,7 +764,9 @@ class SlamBackend:
             
         except Exception as e:
             if self.logger:
-                self.logger.error(f"[SLAM_OPTIMIZATION_FAILED] error={e}")
+                import traceback
+                self.logger.error(f"[SLAM_OPTIMIZATION_FAILED_V4] error_type={type(e).__name__}, error_msg={str(e)}")
+                self.logger.error(f"[SLAM_OPTIMIZATION_TRACE_V4] {traceback.format_exc()}")
             return False
             
     def _update_landmark_estimates(self):
@@ -809,20 +1058,21 @@ class SlamBackend:
             # Save to GraphViz format
             self.graph.saveGraph(filename + "_graph.dot", self.current_estimate)
             
-    def _remove_outliers(self):
-        """Remove factors with high error (outliers) from the graph"""
-        if not self.current_estimate:
+    def _remove_outliers(self, angular_velocity: float = 0.0):
+        """Remove factors with high error (outliers) from the graph
+        
+        Args:
+            angular_velocity: Current angular velocity for adaptive thresholding
+        """
+        if not self.current_estimate or not self.graph:
             return
             
         try:
-            # Get all factors from ISAM2
-            graph = self.isam2.getFactorsUnsafe()
-            
             factors_to_remove = []
             
-            # Check each factor's error
-            for i in range(graph.size()):
-                factor = graph.at(i)
+            # Check each factor's error in our main graph
+            for i in range(self.graph.size()):
+                factor = self.graph.at(i)
                 if factor is None:
                     continue
                     
@@ -831,43 +1081,40 @@ class SlamBackend:
                     error = factor.unwhitenedError(self.current_estimate)
                     chi2_error = np.dot(error, error)
                     
-                    # For bearing-range factors, we have 2 DOF
-                    # Chi-squared threshold at 99% confidence for 2 DOF is ~9.21
-                    if chi2_error > self.config.chi2_threshold:
+                    # Adaptive threshold based on angular velocity
+                    # During turns, we expect higher errors due to uncertainty
+                    angular_velocity_scale = 1.0 + abs(angular_velocity) * 0.5  # Up to 2x at 2 rad/s
+                    adaptive_threshold = self.config.chi2_threshold * angular_velocity_scale
+                    
+                    # For observation factors, we have 3 DOF (x, y, color)
+                    # Chi-squared threshold at 99% confidence for 3 DOF is ~11.34
+                    # For motion factors, we have 4 DOF (x, y, theta, lateral)
+                    if chi2_error > adaptive_threshold:
                         factors_to_remove.append(i)
                         
-                except Exception:
+                except Exception as e:
                     # Skip factors that can't compute error
+                    if self.logger:
+                        self.logger.debug(f"[SLAM_OUTLIER_CHECK] Could not compute error for factor {i}: {e}")
                     continue
             
             # Remove outlier factors
             if factors_to_remove:
                 # Create new graph without outliers
                 new_graph = gtsam.NonlinearFactorGraph()
-                for i in range(graph.size()):
+                for i in range(self.graph.size()):
                     if i not in factors_to_remove:
-                        factor = graph.at(i)
+                        factor = self.graph.at(i)
                         if factor is not None:
                             new_graph.add(factor)
                 
-                # Re-initialize ISAM2 with cleaned graph
-                # Need to recreate params since ISAM2.params() might not work
-                params = gtsam.ISAM2Params()
-                params.setRelinearizeThreshold(self.config.relinearize_threshold)
-                params.relinearizeSkip = self.config.relinearize_skip
-                params.enableRelinearization = True
-                params.evaluateNonlinearError = False
-                params.setFactorization("QR")
-                params.cacheLinearizedFactors = True
-                params.enableDetailedResults = False
-                
-                self.isam2 = gtsam.ISAM2(params)
-                self.isam2.update(new_graph, self.current_estimate)
+                # Replace the graph with the cleaned version
+                self.graph = new_graph
                 
                 # Update statistics
                 self.optimization_stats["outliers_removed"] += len(factors_to_remove)
                 if self.logger:
-                    self.logger.info(f"[SLAM_OUTLIERS_REMOVED] count={len(factors_to_remove)}")
+                    self.logger.info(f"[SLAM_OUTLIERS_REMOVED] count={len(factors_to_remove)}, remaining_factors={self.graph.size()}")
                 
         except Exception as e:
             if self.logger:
@@ -888,3 +1135,37 @@ class SlamBackend:
         self.keyframe_count = 0
         self.landmark_count = 0
         self.factor_keys.clear()
+    
+    def check_async_result(self) -> bool:
+        """Check if async optimization completed and apply results"""
+        if not self.pending_optimization:
+            return False
+            
+        # Try to get result without blocking
+        result = self.async_optimizer.get_result(timeout=0.0)
+        if result is None:
+            return False
+            
+        self.pending_optimization = False
+        
+        if result.success:
+            # Apply optimized values
+            self.current_estimate = result.optimized_values
+            
+            if self.logger:
+                self.logger.info(f"[SLAM_ASYNC_OPT] Applied optimization result: "
+                               f"error={result.error:.6f}, time={result.computation_time*1000:.1f}ms")
+                
+            # Update statistics
+            self.optimization_stats['optimization_count'] += 1
+            self.optimization_stats['total_time'] += result.computation_time
+            self.last_optimization_time = time.time()
+            
+            # Update landmark estimates from optimization
+            self._update_landmark_estimates()
+            
+            return True
+        else:
+            if self.logger:
+                self.logger.error("[SLAM_ASYNC_OPT] Optimization failed")
+            return False

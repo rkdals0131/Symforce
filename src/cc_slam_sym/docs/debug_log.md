@@ -1,5 +1,293 @@
 # CC-SLAM-SYM Debug Log
 
+# Debug Log
+
+## 2025-07-18: Corner Divergence Fix Implementation
+
+### Problem
+- SLAM system diverging at corners in the track
+- Fixed chi-squared thresholds not adapting to increased uncertainty during turns
+- No absolute position constraints leading to drift accumulation
+- Keyframe generation slowing down when divergence starts
+
+### Solution Implemented
+
+#### 1. Adaptive Chi-Squared Thresholds
+- Modified `data_association.py` to accept angular velocity parameter
+- Chi-squared threshold now scales with angular velocity (up to 2x at 2 rad/s)
+- Search radius also increases during turns (up to 1.6x)
+- Backend outlier rejection also uses adaptive thresholds
+
+#### 2. GPS Factor Integration
+- Added `add_gps_factor()` method to backend
+- GPS provides absolute position constraints with 2cm RTK accuracy
+- First GPS fix sets reference frame
+- Subsequent GPS measurements constrain keyframe positions
+
+#### 3. Angular Velocity Propagation
+- Frontend now tracks current angular velocity from odometry
+- Angular velocity passed to data association for adaptive behavior
+- Enables motion-aware association during high angular motion
+
+### Files Modified
+1. `slam_core/data_association.py`: Added angular velocity parameter and adaptive thresholds
+2. `slam_core/backend.py`: Added GPS factor support and adaptive outlier rejection
+3. `slam_core/frontend.py`: Track angular velocity and get_current_keyframe() method
+4. `ros_bridge/data_converter.py`: Added GPS odometry to GpsData conversion
+5. `ros_bridge/slam_ros_node.py`: Subscribe to GPS and process GPS measurements
+
+### Testing Instructions
+
+```bash
+# Terminal 1: Launch SLAM
+cd ~/ROS2_Workspace/Symforce_ws
+colcon build --packages-select cc_slam_sym --symlink-install
+source install/setup.bash
+ros2 launch cc_slam_sym slam_launch.py
+
+# Terminal 2: Monitor logs
+ros2 run rqt_console rqt_console
+# Set filter to "SLAM_" to see SLAM-specific messages
+# Look for:
+# - [SLAM_GPS_REFERENCE] when GPS reference is set
+# - [SLAM_GPS_FACTOR] for GPS constraints being added
+# - [SLAM_ASSOCIATION] messages showing adaptive chi2 thresholds
+
+# Terminal 3: Run figure-8 test
+ros2 param set /dummy_publisher scenario 2  # Formula Student track
+```
+
+### Expected Behavior
+1. System should maintain accurate pose through corners
+2. Chi-squared thresholds should increase during turns (visible in logs)
+3. GPS factors should prevent long-term drift
+4. No divergence at corner sections
+5. Consistent keyframe generation rate
+
+### Performance Metrics to Monitor
+- Association success rate during turns
+- Optimization convergence after GPS constraints
+- Trajectory error relative to ground truth
+- Processing time stability
+
+### Result
+- Successfully implemented adaptive thresholds and GPS constraints
+- System should now handle corners without divergence
+- GPS provides global consistency while visual odometry maintains local accuracy
+
+## 2025-07-18 (Update): System Architecture Alignment
+
+### Problem
+- Initial GPS implementation didn't align with system architecture
+- System has two odometry modes: internal simulation vs external fusion
+- AttributeError: '_gps_callback' was missing
+
+### System Architecture Understanding
+
+#### Odometry Modes
+1. **Internal Mode** (odom_sim_enabled=true):
+   - Dummy simulator generates wheel odometry with drift
+   - Publishes to `/odom_sim`
+   - SLAM subscribes to raw odometry
+
+2. **External Mode** (odom_sim_enabled=false):
+   - robot_localization EKF fuses IMU + GPS
+   - Publishes to `/odometry/filtered`
+   - SLAM subscribes to fused odometry
+
+#### Sensor Fusion Approaches
+1. **External Fusion** (current default):
+   - robot_localization handles sensor fusion
+   - SLAM receives fused odometry
+   - GPS factors in SLAM disabled by default
+
+2. **Internal Fusion** (optional):
+   - SLAM directly processes sensors
+   - GPS factors add absolute constraints
+   - Future: IMU preintegration
+
+### Solution
+- Made GPS factors configurable via `sensor_fusion.use_gps_factors`
+- Fixed missing `_gps_callback` method
+- GPS subscription only created when GPS factors enabled
+- Aligns with both architecture modes
+
+### Configuration
+```yaml
+sensor_fusion:
+  mode: "external"              # or "internal"
+  use_gps_factors: false        # Enable for direct GPS constraints
+  use_imu_preintegration: false # Future feature
+```
+
+### Testing Both Modes
+
+#### Mode 1: External Fusion (Default)
+```bash
+# Use fused odometry from robot_localization
+ros2 param set /cc_slam_node sensor_fusion.use_gps_factors false
+ros2 param set /dummy_publisher odometry_simulation.enable false
+```
+
+#### Mode 2: Internal GPS Factors
+```bash
+# Use raw odometry + GPS factors in SLAM
+ros2 param set /cc_slam_node sensor_fusion.use_gps_factors true
+ros2 param set /dummy_publisher odometry_simulation.enable true
+```
+
+## 2025-07-17 - Optimization Failure Bug
+**Problem**: SLAM optimization was failing with "Optimization returned False!" and "Backend current_estimate is None"
+**Cause**: `_update_landmark_estimates()` method was trying to use `self.isam2.getFactorsUnsafe()` but backend switched to batch optimization, so ISAM2 doesn't exist
+**Solution**: Changed line 530 to use `self.graph` instead of `self.isam2.getFactorsUnsafe()`
+**Result**: Optimization should now complete successfully
+
+## 2025-07-17 - Association Result Not Used  
+**Problem**: Keyframes were storing raw observations but trying to match by track_id, resulting in no observation factors being added
+**Cause**: Association results were computed but ignored when creating keyframes
+**Solution**: 
+1. Modified Keyframe dataclass to store association_result
+2. Updated slam_ros_node to pass association_result to create_keyframe
+3. Changed observation factor creation to use association result matched pairs
+**Result**: Observation factors now properly added to graph
+
+## 2025-07-17 - Performance Analysis
+**Issue**: User concerned about system lag and performance
+**Analysis**:
+- Input: 100Hz odometry, 20Hz cone observations  
+- Keyframe creation: Every 2m/0.3rad/1s (reasonable)
+- Optimization: Every 5 keyframes (reasonable)
+- Sliding window: 20 keyframes (might be too large)
+**Recommendations**:
+1. Reduce sliding window to 10-15 keyframes
+2. Consider increasing keyframe distance threshold to 3-4m
+3. Monitor optimization timing with new fixes
+
+## 2025-07-17 - Keyframe Density Optimization
+**Problem**: Excessive information condensation - up to 16 observations collapsed into single keyframe at low speeds
+**Analysis**: At 2.5 m/s, 800ms of temporal data compressed into one timestamp, losing motion dynamics
+**Solution**: 
+1. Reduced keyframe distance threshold: 2.0m → 1.0m
+2. Reduced rotation threshold: 0.3 → 0.2 rad
+3. Reduced time threshold: 1.0s → 0.3s
+4. Adjusted optimization interval: 5 → 10 keyframes
+5. Reduced sliding window: 20 → 15 keyframes
+**Result**: Better temporal resolution while maintaining 15m trajectory coverage
+
+## 2025-07-17 - Critical System Failure Diagnosis
+**Problem**: Complete SLAM system breakdown - following noisy odometry, keyframe spacing collapse, duplicate landmarks
+**Diagnosis**: 
+1. `current_estimate` initialized as None causing all optimizations to fail
+2. No multi-threading - single thread processing causing severe bottleneck
+3. No async optimization - blocking entire system during optimization attempts
+4. Failed optimizations → no pose updates → incorrect keyframe spacing calculations
+**Solution**:
+1. Changed `current_estimate = None` to `current_estimate = gtsam.Values()` 
+2. Created AsyncOptimizer class for non-blocking optimization
+3. Planning multi-threaded cone processing
+**Status**: Implementation in progress
+
+## 2025-07-17 - Critical Performance and Optimization Issues Fixed
+
+### Problem
+- System slavishly following noisy odometry without correction
+- Cannot handle even minor outliers
+- Landmark clustering near keyframes
+- Shrinking keyframe intervals due to processing delays
+- Queue overflow from slow processing
+
+### Root Causes Identified
+1. **SymForce Bypass**: Generated optimized code existed but was completely bypassed
+2. **Single-Thread Bottleneck**: Despite multithreading infrastructure, everything ran on one thread
+3. **Robust Kernels Disabled**: Huber kernels commented out, no outlier robustness
+4. **ISAM2/Batch Confusion**: Backend used batch optimization but tried to access ISAM2 for outlier removal
+5. **Greedy Data Association**: No global optimization or re-evaluation after pose correction
+
+### Solutions Implemented
+1. **Re-enabled SymForce Factors**:
+   - Fixed numerical stability issues by increasing epsilon to 1e-6
+   - Now using generated optimized residual functions
+   - Added fallback to simplified version on error
+   - Fixed 4D motion model residual dimension mismatch
+
+2. **Activated AsyncOptimizer**:
+   - Added async optimization request in backend
+   - Processing loop now checks for async results
+   - Non-blocking optimization prevents queue buildup
+   - Proper shutdown handling added
+
+3. **Robust Kernel Configuration**:
+   - Made robust kernels configurable (currently disabled)
+   - Set proper Huber parameter (1.345 for 95% efficiency)
+   - Added support for different kernel types
+   - Using use_bearing_range flag to test robust kernels
+
+4. **Fixed Outlier Rejection**:
+   - Removed ISAM2 references in _remove_outliers
+   - Now correctly uses main graph for outlier detection
+   - Proper chi-squared thresholds for 3/4 DOF factors
+   - Graph replacement instead of ISAM2 re-initialization
+
+### Expected Improvements
+- 2-5x speedup from SymForce optimized functions
+- No queue overflow from async optimization
+- Better outlier handling when robust kernels re-enabled
+- Proper factor graph management without ISAM2 confusion
+- Real multithreaded processing
+
+### Testing Required
+1. Verify SymForce factors compute correctly
+2. Test async optimization doesn't drop critical updates
+3. Enable robust kernels and tune parameters
+4. Validate outlier rejection with high-noise data
+5. Monitor queue sizes and processing rates
+
+## 2025-07-17 - Rigid Constraint Enforcement Fix
+
+### Problem
+- System still not improving after previous fixes
+- Landmarks drifting relative to robot observations
+- Optimization may not be running properly
+
+### Root Cause
+- Observation factors had wrong error calculation
+- Constraints were not truly rigid (relative positions changing)
+- Noise models too loose for rigid constraints
+
+### Solutions Implemented
+1. **Fixed Observation Factor**:
+   - Correct transformation: landmark_robot = pose.transformTo(landmark_world)
+   - Error = predicted - observed (not observed - predicted)
+   - Disabled color penalty to focus on geometry
+   - Added debug output for large errors
+
+2. **Tightened Noise Model**:
+   - Reduced observation noise by 10x (position_noise * 0.1)
+   - This enforces that observations are rigid constraints
+   - Disabled robust kernels for strict enforcement
+
+3. **Simplified Motion Model**:
+   - Using direct pose composition instead of SymForce
+   - 3D error (x, y, theta) instead of 4D with lateral
+   - More reliable and easier to debug
+
+4. **Enhanced Debugging**:
+   - Always log backend state and optimization triggers
+   - Print large observation errors
+   - Track keyframe counting
+
+### Critical Insight
+The key constraint that must be enforced: **The relative position of a landmark observed from a particular pose should NEVER change**. This is now enforced by:
+- Tight noise model (0.1 * nominal)
+- Correct transformation direction
+- No robust kernels to allow outliers
+
+### Next Steps
+1. Test if optimization now runs every 10 keyframes
+2. Verify landmarks stay fixed relative to observing poses
+3. Check for "[LARGE_ERROR]" messages in console
+4. Monitor "[SLAM_TRIGGER_OPTIMIZATION]" messages
+
 ## 2025-07-16
 
 ### Problem: GTSAM CustomFactor ISAM2 Jacobian Error
